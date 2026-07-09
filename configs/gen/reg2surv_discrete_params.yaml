@@ -1,0 +1,42 @@
+# Reg2SurvDiscrete (SUMO-style) configuration.
+#
+# Each _bounds entry is a two-element list [min, max] (or [scale, shift] for
+# alpha).  All distributions are uniform / uniform-int except alpha, which is
+# sampled as  alpha = Beta(1.1, 1.1) * scale + shift  (see generate5.py).
+n_grid: 100
+
+# alpha = Beta(1.1, 1.1) * scale + shift  =>  alpha in [shift, shift + scale]
+alpha_bounds:      [1.0, 0.5]   # [scale, shift]  -> alpha in [0.3, 1.8] alpha = Beta(1.1, 1.1) * scale + shift
+gamma_k_bounds:    [0.1, 2.0]
+mu_t_bounds:       [0.0, 1.0]
+lambda_eta_bounds: [0.1, 1.0]
+
+n_event_layers_bounds: [1, 1] # number of hidden layers
+event_layer_bounds:    [8, 2048]
+n_cens_layers_bounds:  [1, 1]
+cens_layer_bounds:     [8, 2048] 
+
+# Optional independent bounds for the censoring net (defaults to the event-net
+# bounds when omitted).
+alpha_cens_bounds:      [1.0, 0.5]
+gamma_k_cens_bounds:    [0.1, 2.0]
+mu_t_cens_bounds:       [0.0, 1.0]
+
+t_max_bounds:          [1.0, 10000.0]
+censoring_rate_bounds: [0.01, 0.99]
+
+# Rejection sampling (set event_net_max_tries > 1 to enable; defaults below
+# keep the check inert when tries == 1).
+event_net_max_tries:         1
+event_net_min_median_delta:  0.05
+event_net_max_flat_frac:     1.0
+event_net_delta_eps:         1.0e-3
+event_net_check_n:           256
+
+# Regenerate if all observed times are identical (degenerate dataset).
+# Uses: spread = max(T_obs) - min(T_obs); accept iff spread > (rel * t_max + abs).
+time_max_tries: 10
+time_min_spread_rel: 1.0e-8
+time_min_spread_abs: 1.0e-12
+
+dtype: float32

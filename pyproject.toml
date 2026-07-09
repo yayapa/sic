@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sic"
+dynamic = ["version"]
+description = "Survival In-Context: amortized Bayesian survival analysis via prior-fitted networks."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "SIC authors" }]
+keywords = ["survival analysis", "in-context learning", "prior-fitted networks", "tabular", "PFN"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Runtime deps: `pip install sic` or `pip install -e .`
+# Dev (notebooks, linting, git hooks): `pip install -e ".[dev]"`
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "scikit-learn>=1.2",
+    "scipy>=1.9",
+    "numba>=0.57",
+    "pycox>=0.2.3",
+    "huggingface_hub>=0.20",
+    "platformdirs>=3.0",
+    "scikit-survival>=0.21",
+    "lifelines>=0.27",
+    "SurvivalEVAL==0.6.1",
+    "wandb>=0.22.3",
+    "tqdm",
+    "pyyaml",
+    "ipython>=8.18.1",
+    "einops>=0.8.2",
+    "jupyter>=1.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pre-commit",
+    "matplotlib>=3.6",
+    "jupyter",
+]
+
+[project.urls]
+Homepage = "https://github.com/sdm/sic"
+"Model weights" = "https://huggingface.co/yayapa/sic"
+
+[project.scripts]
+sic-strip-notebooks = "sic.strip_notebooks:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.dynamic]
+version = { attr = "sic.__about__.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sic = ["train/datasets/*.csv"]

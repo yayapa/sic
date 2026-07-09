@@ -1,0 +1,12 @@
+# Install: pip install -e ".[dev]" && bash scripts/install-git-hooks.sh
+repos:
+  - repo: local
+    hooks:
+      - id: strip-notebooks
+        name: strip notebook outputs
+        entry: bash scripts/strip-notebooks-hook.sh
+        language: system
+        files: \.ipynb$
+        exclude: ^\.ipynb_checkpoints/
+        pass_filenames: true
+        stages: [pre-commit, pre-push]
