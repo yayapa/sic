@@ -70,7 +70,7 @@ SIC is not survival-head independent. The default is the `DeepHit10` head. We al
 | `DeepHit10` / `DeepHit50` / `DeepHit100` | discrete-time DeepHit  | 10 / 50 / 100 bins                                             |
 | `CoxPH`                                      | proportional hazards   | 1 log-hazard / subject                                         |
 | `DeepEH`                                     | extended hazard        | 2 hazards / subject                                            |
-| `SuMo` (TODO)                                | Neural ODE formulation | S(t,x) / subject where x and specific t are required for input |
+| `SuMoPP`                                     | SuMo++ (MONDE+)        | continuous S(t,x); monotone in t with S(0)=1 exact             |
 
 ### Post-training calibration
 

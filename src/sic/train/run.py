@@ -39,6 +39,9 @@ from sic.train.survUtils import (
     predict_surv_coxph_2, predict_surv_deepeh, deepeh_loss,
     sum_concordant_antolini, d_calibration,
 )
+from sic.model.sumo_utils import (
+    nll_loss, bce_loss, combo_bce_loss, predict_surv_sumo, compute_t_scale,
+)
 from pycox.models.loss import DeepHitSingleLoss
 from pycox.preprocessing.label_transforms import LabTransDiscreteTime
 from pycox.models.data import pair_rank_mat
@@ -487,8 +490,13 @@ class Trainer:
 
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         checkpoint_path = os.path.join(self.config.checkpoint_dir, name)
+        config = dict(self.model_config)
+        if self.config.surv_model_type == "sumo_pp":
+            # Record the time-scale rule so inference reproduces the training
+            # scaling; api.py pops it back out (it is not a TabICL argument).
+            config["sumo_tscale_q"] = self.config.sumo_tscale_q
         checkpoint = {
-            "config": self.model_config,
+            "config": config,
             "state_dict": self.raw_model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
@@ -670,6 +678,14 @@ class Trainer:
                 #time_grid_new = pycox_utils.make_subgrid(labtrans.cuts, sub)
 
                 S = predict_surv_new_times_deephit(S, time_grid_old, time_grid_new)
+
+            elif self.config.surv_model_type == "sumo_pp":
+                res = self.model(X, y_train)
+                emb_test = res["emb_test"].squeeze(0)        # (Tq, d_model)
+                head = res["sumo_head"]
+                time_grid_t = torch.tensor(time_grid, device=emb_test.device, dtype=emb_test.dtype)
+                t_scale = compute_t_scale(T_train, self.config.sumo_tscale_q)
+                S = predict_surv_sumo(emb_test, time_grid_t, head, t_scale=t_scale)
 
             S = S.detach().cpu().numpy()
 
@@ -955,7 +971,7 @@ class Trainer:
                     loss = 0.0
                     B_n = 0
                     for b in range(B):
-                        try: 
+                        try:
                             deep_eh_loss = deepeh_loss(log_hazard[b].squeeze(1), T_test[b], E_test[b])
                         except Exception as ex:
                             print("DeepEH loss computation error:")
@@ -968,6 +984,40 @@ class Trainer:
                         loss = loss / B_n
                     else:
                         loss = log_hazard.sum() * 0.0
+                elif self.config.surv_loss in ("nll", "bce", "combo_bce"):
+                    # sumo_pp continuous head. Per task: build the loss from the
+                    # query embeddings, the head, and the task's t_scale.
+                    head = out["sumo_head"]
+                    if self.config.surv_loss == "nll":
+                        _loss_fn = nll_loss
+                    elif self.config.surv_loss == "bce":
+                        _loss_fn = functools.partial(bce_loss, sigma_frac=self.config.bce_sigma)
+                    else:  # combo_bce: NLL + bce_weight * BCE
+                        _loss_fn = functools.partial(
+                            combo_bce_loss,
+                            bce_weight=self.config.bce_weight,
+                            sigma_frac=self.config.bce_sigma,
+                        )
+                    loss = tensor(0.0, device=self.config.device)
+                    B_eff = 0
+                    for b in range(B):
+                        Xb = out["emb_test"][b]          # (Tq, d_model)
+                        Tb = T_test[b]                   # (Tq,)
+                        Eb = E_test[b]                   # (Tq,)
+                        if Tb.numel() == 0:
+                            continue
+                        try:
+                            t_scale = compute_t_scale(T_train[b], self.config.sumo_tscale_q)
+                            ll = _loss_fn(head, Xb, Tb, Eb, t_scale=t_scale)
+                        except Exception as ex:
+                            print("SuMo loss computation error:", ex)
+                            continue
+                        loss += ll
+                        B_eff += 1
+                    if B_eff > 0:
+                        loss = loss / B_eff
+                    else:
+                        loss = loss + micro_X.sum() * 0.0
 
             # Scale for grad accumulation
             scaled_loss = loss / num_micro_batches
@@ -1035,6 +1085,19 @@ class Trainer:
                                 tt = torch.zeros((len(time_grid),), device=self.config.device)
                                 dlt = torch.zeros((len(time_grid),), device=self.config.device)
                                 ind_sort = torch.zeros((len(time_grid),), device=self.config.device)
+                                continue
+                        elif self.config.surv_loss in ("nll", "bce", "combo_bce"):
+                            head = out["sumo_head"]
+                            try:
+                                t_scale = compute_t_scale(T_train[b], self.config.sumo_tscale_q)
+                                S_b = predict_surv_sumo(
+                                    out["emb_test"][b],
+                                    torch.tensor(time_grid, device=self.config.device, dtype=out["emb_test"][b].dtype),
+                                    head,
+                                    t_scale=t_scale,
+                                )
+                            except Exception as e:
+                                print(f"Error in predict_surv_sumo for batch {b}: {e}")
                                 continue
 
                         S_b = S_b.detach().cpu().numpy()
@@ -1247,6 +1310,16 @@ def main(argv: list[str] | None = None):
     """Train SIC on synthetic priors. Run via ``python -m sic.train.run``."""
     parser = build_parser()
     config = parser.parse_args(argv)
+
+    # The continuous sumo_pp head and its losses only work as a pair; catch a
+    # mismatch here instead of an opaque error deep inside the training step.
+    sumo_losses = ("nll", "bce", "combo_bce")
+    if (config.surv_model_type == "sumo_pp") != (config.surv_loss in sumo_losses):
+        parser.error(
+            f"--surv_model_type {config.surv_model_type} is incompatible with "
+            f"--surv_loss {config.surv_loss}: the sumo_pp head requires one of "
+            f"{'/'.join(sumo_losses)}, and those losses require sumo_pp."
+        )
 
     try:
         # Set the start method for subprocesses to 'spawn'

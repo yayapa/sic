@@ -10,6 +10,7 @@ from torch import nn, Tensor
 from .layers import Time_to_event_Embedding
 
 from .encoders import Encoder
+from .sumo_utils import SuMoHeadPlusPlus
 
 
 class SurvICLearning(nn.Module):
@@ -75,10 +76,15 @@ class SurvICLearning(nn.Module):
             # DeepEH only consumes the first two columns (g1, g2); the extra
             # width is kept for checkpoint compatibility. See fit_predict_raw.
             self.surv_layer = nn.Linear(d_model * 2, num_bins, bias=True)
+        elif self.surv_model_type == "sumo_pp":
+            # SuMo++: continuous-time head with exact S(0)=1 and a MONDE+ block
+            # (multiplicative time x feature interaction). Consumes the ICL
+            # embeddings directly, so no decoder/logit layer is needed.
+            self.sumo_head = SuMoHeadPlusPlus(d_model=d_model)
         else:
             raise ValueError(
                 f"Unknown surv_model_type={self.surv_model_type!r}. "
-                "Supported: 'coxph', 'deephit', 'deepeh'."
+                "Supported: 'coxph', 'deephit', 'deepeh', 'sumo_pp'."
             )
 
     def forward(self, R: Tensor, y_train: Tensor, time_bin_grid: Tensor) -> Dict[str, Tensor]:
@@ -95,7 +101,10 @@ class SurvICLearning(nn.Module):
         Returns
         -------
         dict with:
-            "log_hazard": (B, T_query, K)  
+            "log_hazard": (B, T_query, K) and "log_hazard_train": (B, train_size, K).
+            For ``sumo_pp`` instead: "emb_test": (B, T_query, d_model) and
+            "sumo_head" (the continuous head module); the trainer builds the
+            loss and curves from these per task.
         """
         train_size = y_train.shape[-1]
         
@@ -106,6 +115,13 @@ class SurvICLearning(nn.Module):
         R[:, :train_size] = R[:, :train_size] + y_train_time_event_emb  #+ y_train_event_enc + y_train_time_enc  + y_time_bin_enc
         src = self.tf_icl(R, attn_mask=train_size) # shape (B, T, d_model)
         src = self.ln(src)
+        if self.surv_model_type == "sumo_pp":
+            # Continuous head: hand the query embeddings and the head to the
+            # trainer, which builds the loss and curves per task.
+            return {
+                "emb_test": src[:, train_size:, :],
+                "sumo_head": self.sumo_head,
+            }
         src = self.decoder_surv(src)
         src = self.surv_layer(src) # time dependent logits
         return {"log_hazard": src[:, train_size:, :], "log_hazard_train": src[:, :train_size, :]}

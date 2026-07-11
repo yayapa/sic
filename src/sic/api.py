@@ -31,6 +31,7 @@ from .train.survUtils import (
     predict_surv_coxph_2,
     predict_surv_deepeh,
 )
+from .model.sumo_utils import predict_surv_sumo, compute_t_scale, DEFAULT_TSCALE_Q
 
 ArrayLike = Union[np.ndarray, pd.DataFrame, "torch.Tensor"]
 
@@ -123,7 +124,8 @@ class SIC:
     Parameters
     ----------
     survival_head : str, default="DeepHit10"
-        One of ``DeepHit10``, ``DeepHit50``, ``DeepHit100``, ``CoxPH``, ``DeepEH``.
+        One of ``DeepHit10``, ``DeepHit50``, ``DeepHit100``, ``CoxPH``, ``DeepEH``,
+        ``SuMoPP``.
     device : str or torch.device, optional
         Defaults to CUDA when available, else CPU.
     model_path : str or Path, optional
@@ -189,6 +191,11 @@ class SIC:
         config = checkpoint.get("config") or build_model_config(head)
         config = dict(config)
         config.setdefault("mode", "survival")
+
+        # sumo_pp only: the time scale the head was trained with. It lives in the
+        # checkpoint config (not a TabICL arg), so pop it out before building the
+        # model; default to the p95 rule for older checkpoints that omit it.
+        self.sumo_tscale_q = config.pop("sumo_tscale_q", DEFAULT_TSCALE_Q)
 
         model = TabICL(**config)
         missing, unexpected = model.load_state_dict(checkpoint["state_dict"], strict=False)
@@ -307,12 +314,21 @@ class SIC:
         * DeepHit*: ``{"head", "logits" (N, K), "pmf" (N, K), "bin_edges" (K,)}``
         * CoxPH:    ``{"head", "log_hazard" (N, 1), "baseline_times", "baseline_survival"}``
         * DeepEH:   ``{"head", "g" (N, 2)}``
+        * SuMoPP:   ``{"head", "survival" (N, M), "times" (M,)}`` on the native grid
         """
         self._ensure_model(survival_head)
         X_train_t, X_test_t, T_train, E_train = self._prepare(X_train, y_train, X_test)
-        out = self._forward(X_train_t, X_test_t, T_train, E_train)
 
         head = self.survival_head
+        if self.surv_model_type == "sumo_pp":
+            # Continuous head: the native grid (sorted unique training times) is
+            # exactly what ``_predict_curves`` uses for ``eval_times=None``, so
+            # delegate to keep a single sumo prediction path.
+            S, grid_np = self._predict_curves(X_train_t, X_test_t, T_train, E_train, eval_times=None)
+            return {"head": head, "survival": S, "times": grid_np}
+
+        out = self._forward(X_train_t, X_test_t, T_train, E_train)
+
         if self.surv_model_type == "deephit":
             logits = out["log_hazard"].squeeze(0)  # (N, K)
             from pycox.models.utils import pad_col
@@ -414,6 +430,18 @@ class SIC:
                                 device=self.device, dtype=torch.float32)
             S = predict_surv_new_times_deephit(S, src_times, grid)
             return S.detach().cpu().numpy(), grid.detach().cpu().numpy()
+
+        if mt == "sumo_pp":
+            emb_test = out["emb_test"].squeeze(0)  # (N, d_model)
+            head = out["sumo_head"]
+            t_scale = compute_t_scale(T_train, self.sumo_tscale_q)
+            if eval_times is None:
+                grid_np = np.unique(np.sort(T_train.squeeze(0).cpu().numpy()))
+            else:
+                grid_np = np.asarray(eval_times, dtype=float)
+            grid = torch.tensor(grid_np, device=self.device, dtype=emb_test.dtype)
+            S = predict_surv_sumo(emb_test, grid, head, t_scale=t_scale)  # (N, M)
+            return S.detach().cpu().numpy(), grid_np
 
         raise ValueError(f"Unsupported surv_model_type={mt}.")
 
