@@ -339,86 +339,140 @@ def normal_density(a):
     b = 0.3989423*torch.exp(-0.5*torch.pow(a,2.0))
     return b
 
+
+_DEEPEH_MAX_RIEMANN_POINTS = 4096
+_DEEPEH_EPS = 1e-8
+
+
+def _deepeh_riemann_gap(T_min, eval_times, gap=0.1, max_points=_DEEPEH_MAX_RIEMANN_POINTS):
+    """Widen the Riemann step when the time span would exceed ``max_points``."""
+    t_max = max(float(torch.max(eval_times)), T_min + gap)
+    span = max(t_max - T_min, gap)
+    return max(gap, span / max_points)
+
+
+def _build_deepeh_riemann_grid(T_min, eval_times, d, dtype, device):
+    """Build the Riemann grid and index map for DeepEH survival evaluation."""
+    eval_times = torch.as_tensor(eval_times, dtype=dtype, device=device).flatten()
+    T_min = max(float(T_min), _DEEPEH_EPS)
+    M = eval_times.numel()
+    ind_si = torch.zeros(M, dtype=torch.int64, device=device)
+    T0 = T_min
+    a = eval_times[0].item() - T_min
+
+    if d < a:
+        TT0 = np.arange(T_min, eval_times[0].item(), min(a, d))
+        n0 = len(TT0) - 1
+        dt0 = min(a, d) * np.ones(len(TT0))
+    else:
+        TT0 = np.append(T_min, eval_times[0].item())
+        n0 = 1
+        dt0 = np.append(T_min, a)
+
+    for k in range(M):
+        T1 = eval_times[k].item()
+        dd = T1 - T0
+        if k == 0:
+            ind_si[k] = n0
+            T = TT0
+            dt = dt0
+        elif dd == 0:
+            ind_si[k] = ind_si[k - 1]
+        elif dd <= d:
+            ind_si[k] = ind_si[k - 1] + 1
+            T = np.append(T, T1)
+            dt = np.append(dt, dd)
+        else:
+            TT0 = np.arange(T0, T1, d)
+            dt0 = d * np.ones(len(TT0))
+            n0 = len(TT0) - 1
+            ind_si[k] = ind_si[k - 1] + n0
+            T = np.append(T, TT0[1:])
+            dt = np.append(dt, dt0[1:])
+        T0 = T1
+
+    m = len(T)
+    T_t = torch.from_numpy(T).view(1, m).to(device=device, dtype=dtype)
+    dt_t = torch.from_numpy(dt).view(1, m).to(device=device, dtype=dtype)
+    return T_t, dt_t, ind_si
+
+
+def predict_surv_deepeh_at_grid(
+    g_train: torch.Tensor,
+    T_train: torch.Tensor,
+    E_train: torch.Tensor,
+    g_test: torch.Tensor,
+    time_grid: torch.Tensor,
+    Riemann_sum_gap: float = 0.1,
+) -> torch.Tensor:
+    """Survival S(t|x) for DeepEH on an arbitrary time grid.
+
+    g_train : (N_tr, 2)  training (g1, g2)
+    T_train : (N_tr,)    training times
+    E_train : (N_tr,)    training event indicators
+    g_test  : (N, 2)     test (g1, g2)
+    time_grid : (M,)     evaluation times
+    returns : (N, M)     survival probabilities
+    """
+    time = T_train.squeeze()
+    delta = E_train.squeeze().float()
+    out = g_train[:, :2]
+    out_new = g_test[:, :2]
+    device = time.device
+    dtype = time.dtype
+
+    time_grid = torch.as_tensor(time_grid, dtype=dtype, device=device).flatten()
+    time_grid, _ = torch.sort(time_grid)
+    M = time_grid.numel()
+    N = out_new.size(0)
+    if M == 0 or N == 0:
+        return torch.zeros((N, M), device=device, dtype=dtype)
+
+    T_min = max(torch.min(time).item(), _DEEPEH_EPS)
+    gap = _deepeh_riemann_gap(T_min, time_grid, Riemann_sum_gap)
+    T, dt, ind_si = _build_deepeh_riemann_grid(T_min, time_grid, gap, dtype, device)
+
+    expg1_new = torch.exp(out_new[:, 0].view(N, 1))
+    expg2_new = torch.exp(out_new[:, 1].view(N, 1))
+    S = torch.zeros(N, M, device=device, dtype=dtype)
+    for i in range(N):
+        haz = hazard_fun(out, time, delta, expg1_new[i, 0] * T)
+        A = torch.exp(-expg2_new[i, 0] * torch.cumsum(dt * haz, dim=1))
+        S[i, :] = A[0, ind_si]
+    return S
+
+
 def predict_surv_deepeh(out, time, delta, out_new, time_new, delta_new, Riemann_sum_gap=0.1, integral_id=0):
     d = Riemann_sum_gap
     time_new, ind_sort = time_new.sort()
     delta_new = delta_new[ind_sort]
     out_new = out_new[ind_sort,:]
-    T_min = torch.min(time).item()
-    #T_min = min(min(time), min(time_new)).numpy()
-    n_new = len(out_new[:,0])
-    
-    time_new = time_new.view(n_new,1)
-    delta_new = delta_new.view(n_new,1)
-    _, ib = out.size()
-    expg1_new = torch.exp(out_new[:,0].view(n_new,1)).to(device=time.device)
-    
-    if ib == 2:
-        expg2_new = torch.exp(out_new[:,1].view(n_new,1)).to(device=time.device)
-    
-    ####################################
-    ind_si = torch.zeros(n_new,dtype=int)
-    T0 = T_min   
-    a = (time_new[0].item()-T_min)# (time_new[0].numpy()-T_min)/2
+    n_new = len(out_new[:, 0])
+    time_new = time_new.view(n_new, 1)
+    delta_new = delta_new.view(n_new, 1)
+    expg1_new = torch.exp(out_new[:, 0].view(n_new, 1)).to(device=time.device)
+    expg2_new = torch.exp(out_new[:, 1].view(n_new, 1)).to(device=time.device)
 
-    if d < a:
-         TT0 = np.arange(T_min, time_new[0].item(), min(a,d))
-         n0 = len(TT0)-1
-         dt0 = min(a,d)*np.ones(len(TT0))
+    if integral_id == 0:
+        T_min = max(torch.min(time).item(), _DEEPEH_EPS)
+        gap = _deepeh_riemann_gap(T_min, time_new.view(-1), d)
+        T, dt, ind_si = _build_deepeh_riemann_grid(
+            T_min, time_new.view(-1), gap, time.dtype, time.device,
+        )
+        mat_si = torch.zeros(n_new, n_new, device=time.device, dtype=time.dtype)
+        for i in numba.prange(n_new):
+            A = torch.exp(
+                -expg2_new[i, 0] * torch.cumsum(
+                    dt * hazard_fun(out, time, delta, expg1_new[i, 0] * T), dim=1,
+                )
+            )
+            mat_si[i, :] = A[0, ind_si]
+        ss = mat_si
+        tt = time_new.view(-1).cpu().numpy()
+        dlt = delta_new.view(-1).cpu().numpy()
     else:
-         TT0 = np.append(T_min, time_new[0].item())
-         n0 = 1
-         dt0 = np.append(T_min, a)
-        
-     
-    for k in range(n_new):
-         T1 = time_new[k].item()
-         dd = (T1 - T0)
-    
-         if k == 0:
-             ind_si[k] = n0
-             T = TT0
-             dt = dt0
-         else:
-             if dd == 0:
-                 ind_si[k] = ind_si[k-1]
-             else:
-                 if (dd <= d):
-                     ind_si[k] = ind_si[k-1] + 1
-                     T = np.append(T,T1)
-                     dt = np.append(dt,dd)
-                 else:
-                     TT0 = np.arange(T0, T1, d)
-                     dt0 = d*np.ones(len(TT0))
-                     n0 = len(TT0)-1
-                     ind_si[k] = ind_si[k-1] + n0
-                     T = np.append(T,TT0[1:])
-                     dt = np.append(dt,dt0[1:])                   
-         T0 = T1 
-     
-    m = len(T)
-    T = torch.from_numpy(T).view(1,m)
-    T = T.type_as(time)
-    T = T.to(device=time.device)
-    dt = torch.from_numpy(dt).view(1,m) 
-    dt = dt.type_as(time)
-    dt = dt.to(device=time.device)
-     
-    if (integral_id == 0):#(integral_id == 'gbsg')|(integral_id == 'metabric'):
-         mat_si = torch.zeros(n_new,n_new) 
-         #T_med = torch.zeros(n_new,1)
-         
-         #for i in range(n_new):
-         for i in numba.prange(n_new):
-            A = (torch.exp(-expg2_new[i,0]*torch.cumsum(dt*hazard_fun(out, time, delta, expg1_new[i,0]*T), dim=1)))
-            mat_si[i,:] = A[0,ind_si]
-            #T_med[i,:]= max(T[A>=0.5])
-                            
-         #ss= mat_si.detach().numpy()    
-         ss = mat_si
-         tt = time_new.view(-1).cpu().numpy()     # shape (n_new,)
-         dlt = delta_new.view(-1).cpu().numpy()   # shape (n_new,) 
-                                     
+        raise ValueError(f"integral_id={integral_id} is not supported.")
+
     return ss, tt, dlt, ind_sort
 
 
@@ -426,7 +480,7 @@ def hazard_fun(out, time, delta, t):
     # t is a vector of input evaluated time
     n = len(out[:,0])
     h = 1.30*math.pow(n,-0.2)  ## or 1.59*n^(-1/3)
-    time = time.view(n,1)
+    time = torch.clamp(time.view(n, 1), min=_DEEPEH_EPS)
     delta = delta.view(n,1)
     ia, ib = out.size()
     g1 = out[:,0].view(n,1)
@@ -440,20 +494,22 @@ def hazard_fun(out, time, delta, t):
     
     # Rj - Ri
     p = max(len(t),len(torch.t(t)))
-    T = t 
-    T = T.view(1,p)
+    T = torch.clamp(t.view(1, p), min=_DEEPEH_EPS)
     log_t = torch.log(T)
 
     # (1/nh) *sum_j Deltaj * K[(Rj-Ri)/h]
-    Dk = torch.sum(torch.mm(delta, torch.ones([1,p], dtype=out.dtype, device=out.device))\
-                   *normal_density((torch.mm(R,torch.ones([1,p], dtype=out.dtype, device=out.device)) - torch.mm(torch.ones([n,1], dtype=out.dtype, device=out.device), log_t))/h)/h, dim=0)/n
+    z = (torch.mm(R, torch.ones([1, p], dtype=out.dtype, device=out.device))
+         - torch.mm(torch.ones([n, 1], dtype=out.dtype, device=out.device), log_t)) / h
+    z = torch.clamp(z, min=-50.0, max=50.0)
+    Dk = torch.sum(torch.mm(delta, torch.ones([1,p], dtype=out.dtype, device=out.device))
+                   *normal_density(z)/h, dim=0)/n
     
     # Phi((Rj-Ri)/h)
     ncdf=torch.distributions.normal.Normal(torch.tensor([0.0], dtype=out.dtype, device=out.device), torch.tensor([1.0], dtype=out.dtype, device=out.device)).cdf
     L = torch.exp(g2-g1)
 
     dominator = (torch.sum((torch.mm(L,torch.ones([1,p], dtype=out.dtype, device=out.device)))*\
-                           ncdf((torch.mm(R,torch.ones([1,p], dtype=out.dtype, device=out.device)) - torch.mm(torch.ones([n,1], dtype=out.dtype, device=out.device), log_t))/h), dim=0)/n)*T  #LP_sum*T
+                           ncdf(z), dim=0)/n)*T  #LP_sum*T
     lam = Dk/dominator  
     return lam
 

@@ -29,7 +29,7 @@ from .train.survUtils import (
     predict_pmf_deephit,
     predict_surv_new_times_deephit,
     predict_surv_coxph_2,
-    predict_surv_deepeh,
+    predict_surv_deepeh_at_grid,
 )
 from .model.sumo_utils import predict_surv_sumo, compute_t_scale, DEFAULT_TSCALE_Q
 
@@ -278,8 +278,8 @@ class SIC:
         ----------
         eval_times : sequence of float, optional
             Times at which to report survival probabilities. When ``None`` the
-            model-native grid is used (DeepHit bin edges / Cox event times /
-            DeepEH internal grid).
+            model-native grid is used (DeepHit bin edges / sorted unique training
+            times for CoxPH, DeepEH, and SuMoPP).
         survival_head : str, optional
             Override the head for this call (re-loads the corresponding weights).
         post_training_calibration : {None, "cipot", "csd"}
@@ -412,27 +412,16 @@ class SIC:
         if mt == "deepeh":
             log_hazards = out["log_hazard"].squeeze(0)
             log_hazards_train = out["log_hazard_train"].squeeze(0)
-            # DeepEH reconstructs survival on the sorted test times; we then
-            # interpolate onto the requested eval times if given.
-            T_test_dummy = torch.arange(
-                1, X_test_t.shape[1] + 1, device=self.device, dtype=torch.float32
-            )
-            # Use provided eval_times as the query grid when available.
-            S, tt, _, _ = predict_surv_deepeh(
-                log_hazards_train, T_train.squeeze(0), E_train.squeeze(0),
-                log_hazards, T_test_dummy, torch.ones_like(T_test_dummy),
-            )
-            S = torch.as_tensor(S, device=self.device, dtype=torch.float32)
-            src_times = torch.as_tensor(tt, device=self.device, dtype=torch.float32)
-            order = torch.argsort(src_times)
-            src_times = src_times[order]
-            S = S[:, order]
             if eval_times is None:
-                return S.detach().cpu().numpy(), src_times.detach().cpu().numpy()
-            grid = torch.tensor(np.asarray(eval_times, dtype=float),
-                                device=self.device, dtype=torch.float32)
-            S = predict_surv_new_times_deephit(S, src_times, grid)
-            return S.detach().cpu().numpy(), grid.detach().cpu().numpy()
+                grid_np = np.unique(np.sort(T_train.squeeze(0).cpu().numpy()))
+            else:
+                grid_np = np.sort(np.asarray(eval_times, dtype=float))
+            grid = torch.tensor(grid_np, device=self.device, dtype=torch.float32)
+            S = predict_surv_deepeh_at_grid(
+                log_hazards_train[:, :2], T_train.squeeze(0), E_train.squeeze(0),
+                log_hazards[:, :2], grid,
+            )
+            return S.detach().cpu().numpy(), grid_np
 
         if mt == "sumo_pp":
             emb_test = out["emb_test"].squeeze(0)  # (N, d_model)

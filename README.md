@@ -1,4 +1,23 @@
-# SIC: Survival In-Context
+<h1 align="center">SIC</h1>
+<p align="center"><b>Survival In-Context: Amortized Bayesian Survival Analysis via Prior-Fitted Networks</b></p>
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2603.29475"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2603.29475-b31b1b.svg"></a>
+  <a href="https://huggingface.co/yayapa/sic"><img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Checkpoint-yellow.svg"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
+  <a href="#citation"><img alt="Cite" src="https://img.shields.io/badge/Cite-BibTeX-informational.svg"></a>
+</p>
+
+<p align="center">
+  <a href="#installation">Installation</a>  · 
+  <a href="#quick-start">Quick start</a>  · 
+  <a href="#examples">Examples</a>  · 
+  <a href="#benchmarking">Benchmarking</a>  · 
+  <a href="#generating-prior-and-training-your-own-model">Prior</a>  · 
+  <a href="#citation">Cite</a>
+</p>
+
+---
 
 The official implementation of the paper [Survival In-Context: Amortized Bayesian Survival Analysis via Prior-Fitted Networks](https://arxiv.org/pdf/2603.29475)
 
@@ -7,7 +26,6 @@ SIC brings the PFN and ICL paradigms to survival analysis. SIC requires no hyper
 ## Installation
 
 With these steps you can develop and change the model as well as execute on your own datasets. (You may want to omit some steps to use the package as-is.)
-
 
 ### Using Conda
 
@@ -23,7 +41,6 @@ Note 1: For installing pre-commit hooks you can use (not necessary for the usage
 
 Note 2: Model weights and the bundled benchmark data are hosted at [yayapa/sic](https://huggingface.co/yayapa/sic) and downloaded automatically on first use, then cached locally. Override the source repo with the `SIC_HF_REPO` environment variable and the cache/download location with `SIC_CACHE_DIR` (or the standard `HF_HOME`).
 
-
 ### Using uv
 
 ```bash
@@ -31,7 +48,6 @@ git clone https://github.com/yayapa/sic
 cd sic
 uv sync
 ```
-
 
 ## Quick start
 
@@ -45,7 +61,7 @@ X, t, e = data["x"], data["t"], data["e"]
 X_train, X_test = X.iloc[:1500], X.iloc[1500:]
 y_train = make_y(t[:1500], e[:1500])          # scikit-survival style labels
 
-model = SIC()     
+model = SIC()   
 surv = model.fit_predict_surv(
     X_train, y_train, X_test,
     eval_times=[1, 2, 3, 4, 5],             # years; None -> model-native grid
@@ -65,12 +81,12 @@ Everything you need to know about running the model is in the example notebooks:
 
 SIC is not survival-head independent. The default is the `DeepHit10` head. We also have other head checkpoints one may want to try:
 
-| `survival_head`                              | model                  | output                                                         |
-| ---------------------------------------------- | ---------------------- | -------------------------------------------------------------- |
-| `DeepHit10` / `DeepHit50` / `DeepHit100` | discrete-time DeepHit  | 10 / 50 / 100 bins                                             |
-| `CoxPH`                                      | proportional hazards   | 1 log-hazard / subject                                         |
-| `DeepEH`                                     | extended hazard        | 2 hazards / subject                                            |
-| `SuMoPP`                                     | SuMo++ (MONDE+)        | continuous S(t,x); monotone in t with S(0)=1 exact             |
+| `survival_head`                              | model                 | output                                             |
+| ---------------------------------------------- | --------------------- | -------------------------------------------------- |
+| `DeepHit10` / `DeepHit50` / `DeepHit100` | discrete-time DeepHit | 10 / 50 / 100 bins                                 |
+| `CoxPH`                                      | proportional hazards  | 1 log-hazard / subject                             |
+| `DeepEH`                                     | extended hazard       | 2 hazards / subject                                |
+| `SuMoPP`                                     | SuMo++ (MONDE+)       | continuous S(t,x); monotone in t with S(0)=1 exact |
 
 ### Post-training calibration
 
@@ -107,6 +123,8 @@ To increase readability, we plan to release the code for training baselines usin
 
 ## Acknowledgments
 
+We thank [Adil](https://github.com/AdilKoken) for implementing the SuMo++ Head.
+
 We thank the authors of [TabICL](https://arxiv.org/pdf/2502.05564) for making PFNs open source! We used their codebase to develop our model.
 
 Additionally, we actively used in the development the work [CiPOT](https://arxiv.org/pdf/2410.20579v3), [CSD](https://arxiv.org/pdf/2405.07374), and [torchssurv](https://github.com/novartis/torchsurv). We thank the authors for making their code public.
@@ -114,6 +132,20 @@ Additionally, we actively used in the development the work [CiPOT](https://arxiv
 ## LLM Note
 
 The original research code was written by [yayapa](https://github.com/yayapa/). However, for refactoring and publishing the package, LLMs and agentic mode have been actively used. If you see any problems, please report them using issues.
+
+## Citation
+
+```bibtex
+@article{seletkov26sic,
+  title         = {Survival In-Context: Amortized Bayesian Survival Analysis via Prior-Fitted Networks},
+  author        = {Seletkov, Dmitrii and Hager, Paul and Kaissis, Georgios, and Braren, Rickmer and Rueckert, Daniel and Rehms, Raphael},
+  journal       = {arXiv preprint arXiv:2603.29475},
+  year          = {2026},
+  eprint        = {2603.29475},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+```
 
 ## License
 
