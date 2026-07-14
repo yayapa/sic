@@ -301,7 +301,7 @@ class SIC:
                 post_training_calibration, X_train_t, T_train, E_train, S, time_grid, eval_times,
             )
 
-        return pd.DataFrame(S.T, index=time_grid)
+        return pd.DataFrame(S.T, index=np.asarray(time_grid, dtype=np.float32))
 
     def fit_predict_raw(
         self,
@@ -328,7 +328,7 @@ class SIC:
             # exactly what ``_predict_curves`` uses for ``eval_times=None``, so
             # delegate to keep a single sumo prediction path.
             S, grid_np = self._predict_curves(X_train_t, X_test_t, T_train, E_train, eval_times=None)
-            return {"head": head, "survival": S, "times": grid_np}
+            return {"head": head, "survival": S, "times": np.asarray(grid_np, dtype=np.float32)}
 
         out = self._forward(X_train_t, X_test_t, T_train, E_train)
 
@@ -342,7 +342,7 @@ class SIC:
                 "head": head,
                 "logits": logits.cpu().numpy(),
                 "pmf": pmf.detach().cpu().numpy(),
-                "bin_edges": edges.cpu().numpy(),
+                "bin_edges": np.asarray(edges.cpu().numpy(), dtype=np.float32),
             }
         elif self.surv_model_type == "coxph":
             from sic._vendor.torchsurv.loss.cox import baseline_survival_function
@@ -355,7 +355,7 @@ class SIC:
             return {
                 "head": head,
                 "log_hazard": log_hazard.cpu().numpy(),
-                "baseline_times": bs["time"].cpu().numpy(),
+                "baseline_times": np.asarray(bs["time"].cpu().numpy(), dtype=np.float32),
                 "baseline_survival": bs["baseline_survival"].cpu().numpy(),
             }
         elif self.surv_model_type == "deepeh":
