@@ -196,6 +196,9 @@ class SIC:
         # checkpoint config (not a TabICL arg), so pop it out before building the
         # model; default to the p95 rule for older checkpoints that omit it.
         self.sumo_tscale_q = config.pop("sumo_tscale_q", DEFAULT_TSCALE_Q)
+        # Legacy SuMoPP release checkpoints store this metadata but the current
+        # head always uses linear time scaling via ``compute_t_scale``.
+        config.pop("time_warp", None)
 
         model = TabICL(**config)
         missing, unexpected = model.load_state_dict(checkpoint["state_dict"], strict=False)
