@@ -232,7 +232,7 @@ def bce_loss(model, x: torch.Tensor, t: torch.Tensor, e: torch.Tensor,
 
 
 def combo_bce_loss(model, x: torch.Tensor, t: torch.Tensor, e: torch.Tensor,
-                   t_scale=1.0, bce_weight: float = 1.0, sigma_frac: float = 0.1):
+                   t_scale=1.0, bce_weight: float = 0.3, sigma_frac: float = 0.1):
     """``combo_bce = NLL + bce_weight * BCE``.
 
     The right-censored NLL is a proper scoring rule; the pointwise BCE is not

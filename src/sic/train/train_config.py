@@ -249,7 +249,7 @@ def build_parser():
     parser.add_argument("--deephit_loss_sigma", type=float, default=0.1, help="Sigma parameter for DeepHit loss")
     # --- sumo_pp head (nll / bce / combo_bce losses) ---
     parser.add_argument("--sumo_tscale_q", type=str, default="0.95", help="Time-scale rule for the sumo_pp head: 'max' (train maximum) or a quantile in (0,1], e.g. 0.95. Applied at training AND eval so they match; use the same value the checkpoint was trained with.")
-    parser.add_argument("--bce_weight", type=float, default=1.0, help="Weight on the BCE term when surv_loss=combo_bce (loss = NLL + bce_weight*BCE; 0 = pure NLL)")
+    parser.add_argument("--bce_weight", type=float, default=0.3, help="Weight on the BCE term when surv_loss=combo_bce (loss = NLL + bce_weight*BCE; 0 = pure NLL). 0.3 is the validated value; larger weights (e.g. 1.0) destabilize training.")
     parser.add_argument("--bce_sigma", type=float, default=0.1, help="sigma_frac for the BCE time perturbation (sigma = bce_sigma*t_scale); used by surv_loss in {bce, combo_bce}")
     parser.add_argument("--use_xcal", default=False, type=str2bool, help="Whether to use X-CAL (only applied when surv_loss=deephit)")
     parser.add_argument("--xcal_bins", type=int, default=20, help="Number of bins for X-CAL")
