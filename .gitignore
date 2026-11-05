@@ -139,3 +139,11 @@ wandb/
 
 # Generated result CSVs (bundled datasets under src/sic/train/datasets/ stay tracked)
 examples/*.csv
+examples/*.json
+
+# Eval outputs and cluster logs
+eval_results/
+*.out
+*.err
+*.log
+*.xlsx

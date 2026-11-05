@@ -98,6 +98,8 @@ class TabICL(nn.Module):
         mode: str = "survival",
         num_bins: int = 100,
         surv_model_type: str = "deephit",
+        sumo_tscale_q: str | float = 0.95,
+        cens_head: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -117,6 +119,7 @@ class TabICL(nn.Module):
         self.norm_first = norm_first
         self.mode = mode
         self.num_bins = num_bins
+        self.sumo_tscale_q = sumo_tscale_q
 
         self.col_embedder = ColEmbedding(
             embed_dim=embed_dim,
@@ -154,6 +157,8 @@ class TabICL(nn.Module):
                 norm_first=norm_first,
                 num_bins=num_bins,
                 surv_model_type=surv_model_type,
+                sumo_tscale_q=sumo_tscale_q,
+                cens_head=cens_head,
             )
         else:
             self.icl_predictor = ICLearning(

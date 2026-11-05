@@ -118,31 +118,42 @@ class Time_to_event_Embedding(nn.Module):
         else:
             self.time_mlp = None
         self.ln = nn.LayerNorm(embed_dim) if ln else nn.Identity()
-    def forward(self, time: Tensor, event: Tensor) -> Tensor:
+    def forward(self, time: Tensor, event: Tensor, t_scale=1.0) -> Tensor:
         """Embed time-to-event and event indicator into dense representation.
+
+        Time feature (see ``embed_time_feature`` in ``sumo_utils``):
+
+        * div modes (quantile / max): ``log(t / s + eps)`` — 1-homogeneous in the
+          scale statistic, and ``log`` spreads right-skewed durations for the MLP.
+        * minmax: affine ``(t - t_min) / (t_max - t_min)`` in ~[0, 1] (no log).
 
         Parameters
         ----------
         time : Tensor
-            Float tensor of shape (batch_size, sequence_length, 1) containing time-to-event values
+            Float tensor of shape (batch_size, sequence_length) containing time-to-event values
 
         event : Tensor
             Integer tensor of shape (batch_size, sequence_length) containing event indicators
+
+        t_scale : float, Tensor, or TimeNorm dict
+            Per-task time normalization from CONTEXT rows only. A bare float/tensor
+            is treated as a divide-scale (legacy).
 
         Returns
         -------
         Tensor
             Combined embedded representation of shape (batch_size, sequence_length, embed_dim)
         """
+        from .sumo_utils import embed_time_feature
+
         event_emb = self.event_embedder(event.long())
-        #time_emb = torch.log1p(time).unsqueeze(-1)  # log(1 + t) transformation
-        time_emb = time.unsqueeze(-1)
+        time_emb = embed_time_feature(time, t_scale).unsqueeze(-1)
 
         if self.time_mlp is not None:
-            t_scale = self.time_mlp(time_emb)
+            t_feat = self.time_mlp(time_emb)
         else:
-            t_scale = time_emb
-        delta = event_emb * t_scale
+            t_feat = time_emb
+        delta = event_emb * t_feat
         delta = self.ln(delta)
         return delta
 

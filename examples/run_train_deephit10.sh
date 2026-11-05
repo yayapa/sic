@@ -1,17 +1,20 @@
 #!/bin/bash
-# Train SIC on a 50/50 mix of discrete and continuous synthetic priors.
+# Train the DeepHit10 head on a 50/50 mix of discrete and continuous synthetic priors.
 #
 # Usage:
-#   1. Edit DATA_ROOT, CHECKPOINT_ROOT, and CHECKPOINT_PATH below.
+#   1. Edit DATA_ROOT, CHECKPOINT_ROOT, and CHECKPOINT_PATH below (or export them).
 #   2. Run examples/run_genload_continuous.sh and examples/run_genload_discrete.sh first.
 #   3. Activate your sic conda environment.
-#   4. bash examples/run_train_mix.sh
+#   4. bash examples/run_train_deephit10.sh
+#
+# DeepHit with 10 time bins placed at quantiles of each task's training durations.
+# Loss: DeepHit likelihood + alpha * ranking loss (alpha 0.2, sigma 0.1).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA_ROOT="${REPO_ROOT}/data"
-CHECKPOINT_ROOT="${REPO_ROOT}/checkpoints"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${REPO_ROOT}/checkpoints}"
 # TabICL classifier backbone used to initialize the ICL predictor (edit path):
-CHECKPOINT_PATH="${CHECKPOINT_ROOT}/tabicl-classifier-v1.1-0506.ckpt"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-${CHECKPOINT_ROOT}/tabicl-classifier-v1.1-0506.ckpt}"
 
 # activate your sic conda environment
 
@@ -25,9 +28,9 @@ python -m sic.train.run \
     --dtype float32 \
     --np_seed 42 \
     --torch_seed 42 \
-    --max_steps 200 \
+    --max_steps 10000 \
     --batch_size 512 \
-    --micro_batch_size 4 \
+    --micro_batch_size 8 \
     --lr 1e-4 \
     --scheduler cosine_warmup \
     --warmup_proportion 0.02 \
@@ -50,16 +53,13 @@ python -m sic.train.run \
     --ff_factor 2 \
     --norm_first True \
     --only_load_model True \
-    --checkpoint_dir "${CHECKPOINT_ROOT}/DeepHit100_mix" \
+    --checkpoint_dir "${CHECKPOINT_ROOT}/DeepHit10_mix" \
     --checkpoint_path "${CHECKPOINT_PATH}" \
-    --save_temp_every 2000 \
-    --save_perm_every 2000 \
-    --num_bins 10 \
-    --freeze_col_embedder False \
-    --freeze_row_interactor False \
-    --freeze_icl_predictor False \
-    --surv_loss deephit \
+    --save_temp_every 1000 \
+    --save_perm_every 1000 \
     --surv_model_type deephit \
+    --surv_loss deephit \
+    --num_bins 10 \
     --time_binning_scheme quantiles \
-    --deephit_loss_alpha 0.1 \
-    --deephit_loss_sigma 0.2
+    --deephit_loss_alpha 0.2 \
+    --deephit_loss_sigma 0.1

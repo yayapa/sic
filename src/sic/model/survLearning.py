@@ -2,7 +2,7 @@
 #
 # The transformer backbone (column embedding -> row interaction -> in-context
 # learning) is adapted from TabICL (https://github.com/soda-inria/tabicl).
-# The survival heads below (CoxPH / DeepHit / DeepEH) are SIC additions.
+# The survival heads below (CoxPH / DeepHit / DeepEH / SuMo / SuMo++) are SIC additions.
 from __future__ import annotations
 from typing import Dict
 import torch
@@ -10,7 +10,13 @@ from torch import nn, Tensor
 from .layers import Time_to_event_Embedding
 
 from .encoders import Encoder
-from .sumo_utils import SuMoHeadPlusPlus
+from .sumo_utils import (
+    SuMoHead,
+    SuMoHeadPlusPlus,
+    compute_time_norm,
+    CONTINUOUS_SURV_TYPES,
+    DEFAULT_TSCALE_Q,
+)
 
 
 class SurvICLearning(nn.Module):
@@ -35,12 +41,15 @@ class SurvICLearning(nn.Module):
         activation: str | callable = "gelu",
         norm_first: bool = True,
         surv_model_type: str = "deephit",
+        sumo_tscale_q=DEFAULT_TSCALE_Q,
+        cens_head: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.K = num_bins
         self.norm_first = norm_first
         self.surv_model_type = surv_model_type
+        self.sumo_tscale_q = sumo_tscale_q
         
         self.time_to_event_encoder = Time_to_event_Embedding(d_model, non_linear_time=True, num_events=2, ln=True)
         
@@ -76,6 +85,9 @@ class SurvICLearning(nn.Module):
             # DeepEH only consumes the first two columns (g1, g2); the extra
             # width is kept for checkpoint compatibility. See fit_predict_raw.
             self.surv_layer = nn.Linear(d_model * 2, num_bins, bias=True)
+        elif self.surv_model_type == "sumo":
+            # Original SuMo-net mixed monotone head (no h_cov; ICL is the embedding).
+            self.sumo_head = SuMoHead(d_model=d_model)
         elif self.surv_model_type == "sumo_pp":
             # SuMo++: continuous-time head with exact S(0)=1 and a MONDE+ block
             # (multiplicative time x feature interaction). Consumes the ICL
@@ -84,8 +96,14 @@ class SurvICLearning(nn.Module):
         else:
             raise ValueError(
                 f"Unknown surv_model_type={self.surv_model_type!r}. "
-                "Supported: 'coxph', 'deephit', 'deepeh', 'sumo_pp'."
+                "Supported: 'coxph', 'deephit', 'deepeh', 'sumo', 'sumo_pp'."
             )
+        # Training-only censoring head on the same embeddings; inference uses sumo_head only.
+        self.cens_head = None
+        if cens_head:
+            if self.surv_model_type not in CONTINUOUS_SURV_TYPES:
+                raise ValueError("cens_head requires surv_model_type in {'sumo', 'sumo_pp'}")
+            self.cens_head = type(self.sumo_head)(d_model=d_model)
 
     def forward(self, R: Tensor, y_train: Tensor, time_bin_grid: Tensor) -> Dict[str, Tensor]:
         """
@@ -102,25 +120,37 @@ class SurvICLearning(nn.Module):
         -------
         dict with:
             "log_hazard": (B, T_query, K) and "log_hazard_train": (B, train_size, K).
-            For ``sumo_pp`` instead: "emb_test": (B, T_query, d_model) and
-            "sumo_head" (the continuous head module); the trainer builds the
-            loss and curves from these per task.
+            For continuous SuMo / SuMo++: "emb_test": (B, T_query, d_model) and
+            "sumo_head"; the trainer builds the loss and curves from these per task.
         """
         train_size = y_train.shape[-1]
         
         # Encode training labels and add to R for SUPPORT rows.
         y_train_time = y_train[:, 0, :]
         y_train_event = y_train[:, 1, :]
-        y_train_time_event_emb = self.time_to_event_encoder(y_train_time, y_train_event)
+        # Per-task time norm from CONTEXT durations — same rule the continuous
+        # head uses, so trunk and head share one time coordinate.
+        time_norm = compute_time_norm(y_train_time, mode=self.sumo_tscale_q, dim=-1)
+        # Unsqueeze scalar fields to (B, 1) for broadcast against (B, train_size).
+        if time_norm["kind"] == "div":
+            time_norm = {**time_norm, "scale": time_norm["scale"].unsqueeze(-1)}
+        else:
+            time_norm = {
+                **time_norm,
+                "t_min": time_norm["t_min"].unsqueeze(-1),
+                "t_max": time_norm["t_max"].unsqueeze(-1),
+            }
+        y_train_time_event_emb = self.time_to_event_encoder(y_train_time, y_train_event, time_norm)
         R[:, :train_size] = R[:, :train_size] + y_train_time_event_emb  #+ y_train_event_enc + y_train_time_enc  + y_time_bin_enc
         src = self.tf_icl(R, attn_mask=train_size) # shape (B, T, d_model)
         src = self.ln(src)
-        if self.surv_model_type == "sumo_pp":
+        if self.surv_model_type in CONTINUOUS_SURV_TYPES:
             # Continuous head: hand the query embeddings and the head to the
             # trainer, which builds the loss and curves per task.
             return {
                 "emb_test": src[:, train_size:, :],
                 "sumo_head": self.sumo_head,
+                "cens_head": self.cens_head,
             }
         src = self.decoder_surv(src)
         src = self.surv_layer(src) # time dependent logits

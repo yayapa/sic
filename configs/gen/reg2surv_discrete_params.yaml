@@ -3,7 +3,8 @@
 # Each _bounds entry is a two-element list [min, max] (or [scale, shift] for
 # alpha).  All distributions are uniform / uniform-int except alpha, which is
 # sampled as  alpha = Beta(1.1, 1.1) * scale + shift  (see generate5.py).
-n_grid: 100
+#n_grid: 1000
+n_grid: 200
 
 # alpha = Beta(1.1, 1.1) * scale + shift  =>  alpha in [shift, shift + scale]
 alpha_bounds:      [1.0, 0.5]   # [scale, shift]  -> alpha in [0.3, 1.8] alpha = Beta(1.1, 1.1) * scale + shift
@@ -21,9 +22,41 @@ cens_layer_bounds:     [8, 2048]
 alpha_cens_bounds:      [1.0, 0.5]
 gamma_k_cens_bounds:    [0.1, 2.0]
 mu_t_cens_bounds:       [0.0, 1.0]
+# The censoring net now takes the eta channels as input, so it needs its own
+# eta scaling. All-zero (see p_cov_indep_cens) recovers a pure function of t.
+lambda_eta_cens_bounds: [0.1, 1.0]
 
-t_max_bounds:          [1.0, 10000.0]
-censoring_rate_bounds: [0.01, 0.99]
+# Horizon; LogUniform on (lo, hi).
+#t_max_bounds: [10.0, 100000.0] 
+t_max_bounds: [1.0, 10000.0]
+# Target administrative censoring fraction; the default prior for the type 2
+# branch (see type2_quantile_bounds).
+censoring_rate_bounds: [0.1, 0.9]
+
+# Administrative censoring. Independent switches, so both may fire and the
+# earliest cutoff wins.
+p_type1: 0.5                    # fixed horizon
+p_type2: 0.5                    # event-driven
+#type1_quantile_bounds: [0.01, 0.99]
+type1_quantile_bounds: [0.1, 0.9]
+type2_quantile_bounds: [0.1, 0.9]
+
+# Staggered entry: subject i is followed for r_i * tau, r_i = 1 - a * U^(1/k), so the
+# cutoff spreads over an interval instead of tying every still-at-risk subject
+# at one time. Probability 0 recovers the shared-cutoff behaviour.
+p_stagger_entry: 0.75
+accrual_frac_bounds: [0.0, 1.0]   # a: enrolment window, 1 - a is the minimum follow-up
+accrual_shape_bounds: [0.2, 1.0]  # k: 1 uniform accrual, < 1 mass near full follow-up
+
+# Random censoring switch: off means C = +inf (admin-only / uncensored datasets).
+p_random: 0.95
+
+# Censoring dependence mix (exclusive; remainder → covdep = T⊥C|X via noncausal f(X)):
+#   indep  — λ_ηc = 0
+#   info   — SCM sibling η_C (latent-confounded)
+#   covdep — η_C = f(X) from a fresh non-causal SCM
+p_cov_indep_cens: 0.25
+p_informative_cens: 0.0
 
 # Rejection sampling (set event_net_max_tries > 1 to enable; defaults below
 # keep the check inert when tries == 1).
@@ -35,7 +68,7 @@ event_net_check_n:           256
 
 # Regenerate if all observed times are identical (degenerate dataset).
 # Uses: spread = max(T_obs) - min(T_obs); accept iff spread > (rel * t_max + abs).
-time_max_tries: 10
+time_max_tries: 1000
 time_min_spread_rel: 1.0e-8
 time_min_spread_abs: 1.0e-12
 

@@ -3,7 +3,7 @@
 Example
 -------
 >>> from sic import SIC
->>> model = SIC(survival_head="DeepHit10")           # downloads weights on first use
+>>> model = SIC(survival_head="SuMoPP")              # downloads weights on first use
 >>> surv = model.fit_predict_surv(X_train, y_train, X_test, eval_times=times)
 >>> surv.shape        # (len(times), n_test_subjects)
 
@@ -31,13 +31,19 @@ from .train.survUtils import (
     predict_surv_coxph_2,
     predict_surv_deepeh_at_grid,
 )
-from .model.sumo_utils import predict_surv_sumo, compute_t_scale, DEFAULT_TSCALE_Q
+from .model.sumo_utils import (
+    predict_surv_sumo,
+    compute_time_norm,
+    nll_loss,
+    DEFAULT_TSCALE_Q,
+    CONTINUOUS_SURV_TYPES,
+)
 
 ArrayLike = Union[np.ndarray, pd.DataFrame, "torch.Tensor"]
 
 # Practical cap on the in-context training set. The backbone was pre-trained
 # with sequences up to ~60k rows; beyond that inference will OOM on most GPUs.
-MAX_CONTEXT_ROWS = 60000
+MAX_CONTEXT_ROWS = 500000#60000
 
 
 def make_y(time, event) -> np.ndarray:
@@ -118,14 +124,38 @@ def _to_2d_float(X: ArrayLike) -> np.ndarray:
     return np.asarray(X, dtype=np.float32)
 
 
+def _feature_perms(
+    n_features: int,
+    n_estimators: int,
+    rng: np.random.Generator,
+) -> list[list[int]]:
+    """Column orders for test-time ensembling (identity, then cyclic shifts).
+
+    Member 0 is the identity. Members ``1 .. min(M-1, H-1)`` are cyclic column
+    shifts. If ``M > H``, remaining members are seeded random permutations.
+    """
+    if n_estimators < 1:
+        raise ValueError(f"n_estimators must be >= 1, got {n_estimators}.")
+    if n_features < 1:
+        raise ValueError(f"n_features must be >= 1, got {n_features}.")
+    base = np.arange(n_features)
+    perms: list[list[int]] = [base.tolist()]
+    for i in range(1, n_estimators):
+        if i < n_features:
+            perms.append(np.roll(base, i).tolist())
+        else:
+            perms.append(rng.permutation(n_features).tolist())
+    return perms
+
+
 class SIC:
     """In-context survival analysis with a prior-fitted network.
 
     Parameters
     ----------
-    survival_head : str, default="DeepHit10"
+    survival_head : str, default="SuMoPP"
         One of ``DeepHit10``, ``DeepHit50``, ``DeepHit100``, ``CoxPH``, ``DeepEH``,
-        ``SuMoPP``.
+        ``SuMo``, ``SuMoPP``.
     device : str or torch.device, optional
         Defaults to CUDA when available, else CPU.
     model_path : str or Path, optional
@@ -135,23 +165,29 @@ class SIC:
         ``$SIC_HF_REPO`` or the packaged placeholder.
     allow_auto_download : bool, default=True
         Allow downloading the checkpoint when it is not found locally.
-    standardize : bool, default=True
+    standardize : bool, default=False
         z-score covariates using training-set statistics before inference.
     random_state : int, default=42
-        Seed used for reproducible time-bin quantiles / any randomness.
+        Seed used for reproducible feature-permutation ensembles / any randomness.
+    n_estimators : int, default=8
+        Number of feature-permutation ensemble members. Predictions average
+        survival curves ``S(t|x)`` over column orders. ``1`` disables ensembling.
     """
 
     def __init__(
         self,
-        survival_head: str = "DeepHit10",
+        survival_head: str = "SuMoPP",
         device: Optional[Union[str, torch.device]] = None,
         model_path=None,
         repo_id: Optional[str] = None,
         allow_auto_download: bool = True,
         standardize: bool = False,
         random_state: int = 42,
+        n_estimators: int = 8,
     ):
         resolve_head(survival_head)  # validate early
+        if int(n_estimators) < 1:
+            raise ValueError(f"n_estimators must be >= 1, got {n_estimators}.")
         self.survival_head = survival_head
         self.device = torch.device(device) if device is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -161,6 +197,7 @@ class SIC:
         self.allow_auto_download = allow_auto_download
         self.standardize = standardize
         self.random_state = random_state
+        self.n_estimators = int(n_estimators)
 
         self.model: Optional[TabICL] = None
         self.surv_model_type: Optional[str] = None
@@ -192,13 +229,14 @@ class SIC:
         config = dict(config)
         config.setdefault("mode", "survival")
 
-        # sumo_pp only: the time scale the head was trained with. It lives in the
-        # checkpoint config (not a TabICL arg), so pop it out before building the
-        # model; default to the p95 rule for older checkpoints that omit it.
-        self.sumo_tscale_q = config.pop("sumo_tscale_q", DEFAULT_TSCALE_Q)
+        # Time-norm rule for trunk embedding + continuous heads. TabICL accepts
+        # sumo_tscale_q; keep a copy for predict paths that recompute the norm.
+        self.sumo_tscale_q = config.get("sumo_tscale_q", DEFAULT_TSCALE_Q)
         # Legacy SuMoPP release checkpoints store this metadata but the current
-        # head always uses linear time scaling via ``compute_t_scale``.
+        # head always uses linear / minmax time scaling via ``compute_time_norm``.
         config.pop("time_warp", None)
+        # Training-only censoring head: inference uses the event head alone.
+        config.pop("cens_head", None)
 
         model = TabICL(**config)
         missing, unexpected = model.load_state_dict(checkpoint["state_dict"], strict=False)
@@ -270,7 +308,6 @@ class SIC:
         X_test: ArrayLike,
         eval_times: Optional[Sequence[float]] = None,
         survival_head: Optional[str] = None,
-        post_training_calibration: Optional[str] = None,
     ) -> pd.DataFrame:
         """Predict survival curves for ``X_test`` given labeled ``(X_train, y_train)``.
 
@@ -279,11 +316,9 @@ class SIC:
         eval_times : sequence of float, optional
             Times at which to report survival probabilities. When ``None`` the
             model-native grid is used (DeepHit bin edges / sorted unique training
-            times for CoxPH, DeepEH, and SuMoPP).
+            times for CoxPH, DeepEH, SuMo, and SuMoPP).
         survival_head : str, optional
             Override the head for this call (re-loads the corresponding weights).
-        post_training_calibration : {None, "cipot", "csd"}
-            Optional conformal calibration fitted on the training set.
 
         Returns
         -------
@@ -296,12 +331,34 @@ class SIC:
 
         S, time_grid = self._predict_curves(X_train_t, X_test_t, T_train, E_train, eval_times)
 
-        if post_training_calibration is not None:
-            S, time_grid = self._apply_calibration(
-                post_training_calibration, X_train_t, T_train, E_train, S, time_grid, eval_times,
-            )
-
         return pd.DataFrame(S.T, index=np.asarray(time_grid, dtype=np.float32))
+
+    def fit_predict_density_nll(
+        self,
+        X_train: ArrayLike,
+        y_train,
+        X_test: ArrayLike,
+        t,
+        e,
+        survival_head: Optional[str] = None,
+    ) -> float:
+        """Mean SuMo/SuMo++ NLL of ``(t, e)`` for ``X_test`` given the train context.
+
+        ``t_scale`` is computed from **train** durations (same convention as
+        ``fit_predict_surv``). Returns NaN for non-continuous heads.
+        """
+        self._ensure_model(survival_head)
+        if self.surv_model_type not in CONTINUOUS_SURV_TYPES:
+            return float("nan")
+        X_train_t, X_test_t, T_train, E_train = self._prepare(X_train, y_train, X_test)
+        out = self._forward(X_train_t, X_test_t, T_train, E_train)
+        emb = out["emb_test"].squeeze(0)
+        head = out["sumo_head"]
+        t_scale = compute_time_norm(T_train, self.sumo_tscale_q)
+        t_t = torch.as_tensor(np.asarray(t, dtype=np.float64), device=emb.device, dtype=emb.dtype)
+        e_t = torch.as_tensor(np.asarray(e, dtype=np.float64), device=emb.device, dtype=emb.dtype)
+        loss = nll_loss(head, emb, t_t, e_t, t_scale=t_scale)
+        return float(loss.detach().cpu())
 
     def fit_predict_raw(
         self,
@@ -317,13 +374,13 @@ class SIC:
         * DeepHit*: ``{"head", "logits" (N, K), "pmf" (N, K), "bin_edges" (K,)}``
         * CoxPH:    ``{"head", "log_hazard" (N, 1), "baseline_times", "baseline_survival"}``
         * DeepEH:   ``{"head", "g" (N, 2)}``
-        * SuMoPP:   ``{"head", "survival" (N, M), "times" (M,)}`` on the native grid
+        * SuMo / SuMoPP: ``{"head", "survival" (N, M), "times" (M,)}`` on the native grid
         """
         self._ensure_model(survival_head)
         X_train_t, X_test_t, T_train, E_train = self._prepare(X_train, y_train, X_test)
 
         head = self.survival_head
-        if self.surv_model_type == "sumo_pp":
+        if self.surv_model_type in CONTINUOUS_SURV_TYPES:
             # Continuous head: the native grid (sorted unique training times) is
             # exactly what ``_predict_curves`` uses for ``eval_times=None``, so
             # delegate to keep a single sumo prediction path.
@@ -380,7 +437,8 @@ class SIC:
             labtrans.fit(durations_train, events_train)
         return torch.tensor(labtrans.cuts, device=self.device)
 
-    def _predict_curves(self, X_train_t, X_test_t, T_train, E_train, eval_times):
+    def _predict_curves_once(self, X_train_t, X_test_t, T_train, E_train, eval_times):
+        """Single forward pass → survival curves on ``eval_times`` (or native grid)."""
         out = self._forward(X_train_t, X_test_t, T_train, E_train)
         mt = self.surv_model_type
 
@@ -423,10 +481,10 @@ class SIC:
             )
             return S.detach().cpu().numpy(), grid_np
 
-        if mt == "sumo_pp":
+        if mt in CONTINUOUS_SURV_TYPES:
             emb_test = out["emb_test"].squeeze(0)  # (N, d_model)
             head = out["sumo_head"]
-            t_scale = compute_t_scale(T_train, self.sumo_tscale_q)
+            t_scale = compute_time_norm(T_train, self.sumo_tscale_q)
             if eval_times is None:
                 grid_np = np.unique(np.sort(T_train.squeeze(0).cpu().numpy()))
             else:
@@ -437,28 +495,28 @@ class SIC:
 
         raise ValueError(f"Unsupported surv_model_type={mt}.")
 
-    # ------------------------------------------------------------------ #
-    # Calibration wiring
-    # ------------------------------------------------------------------ #
-    def _apply_calibration(self, method, X_train_t, T_train, E_train, S_test, time_grid, eval_times):
-        from . import calibration as cal
+    def _predict_curves(self, X_train_t, X_test_t, T_train, E_train, eval_times):
+        """Predict survival curves, optionally averaging over feature permutations."""
+        if self.n_estimators == 1:
+            return self._predict_curves_once(
+                X_train_t, X_test_t, T_train, E_train, eval_times
+            )
 
-        method = method.lower()
-        if method not in ("cipot", "csd"):
-            raise ValueError(f"post_training_calibration must be None, 'cipot' or 'csd', got {method!r}.")
+        n_features = X_train_t.shape[-1]
+        rng = np.random.default_rng(self.random_state)
+        perms = _feature_perms(n_features, self.n_estimators, rng)
 
-        t_train = T_train.squeeze(0).cpu().numpy()
-        e_train = E_train.squeeze(0).cpu().numpy().astype(int)
-
-        # Calibration curves: predict on the training set as its own query set,
-        # on the same evaluation grid as the test curves.
-        S_cal, tg_cal = self._predict_curves(X_train_t, X_train_t, T_train, E_train, list(time_grid))
-
-        quantile_levels = cal.default_quantile_levels()
-        if method == "cipot":
-            scores = cal.cipot_calibrate(S_cal, tg_cal, t_train, e_train)
-            S_adj = cal.cipot_predict(S_test, time_grid, scores, quantile_levels)
-        else:
-            scores = cal.csd_calibrate(S_cal, tg_cal, t_train, e_train, t_train, e_train, quantile_levels)
-            S_adj = cal.csd_predict(S_test, time_grid, scores, quantile_levels)
-        return S_adj, time_grid
+        curves = []
+        grid_np = None
+        for perm in perms:
+            S_m, grid_m = self._predict_curves_once(
+                X_train_t[..., perm],
+                X_test_t[..., perm],
+                T_train,
+                E_train,
+                eval_times,
+            )
+            curves.append(S_m)
+            if grid_np is None:
+                grid_np = grid_m
+        return np.mean(np.stack(curves, axis=0), axis=0), grid_np

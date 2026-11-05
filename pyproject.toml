@@ -47,9 +47,15 @@ dev = [
     "matplotlib>=3.6",
     "jupyter",
 ]
+# SurvSet benchmark (examples/run_eval_survset.py): `pip install -e ".[survset]"`
+survset = [
+    "SurvSet",
+    "skrub",
+    "openpyxl",
+]
 
 [project.urls]
-Homepage = "https://github.com/sdm/sic"
+Homepage = "https://github.com/yayapa/sic"
 "Model weights" = "https://huggingface.co/yayapa/sic"
 
 [project.scripts]

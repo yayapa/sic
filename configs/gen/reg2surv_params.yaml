@@ -8,16 +8,61 @@ inv_hazard_distribution:
   gompertz: 0.2
   birnbaum-saunders: 0.2
 
+# Target administrative censoring fraction; the default prior for the type 2
+# branch (see type2_quantile_bounds).
 censoring_rate:
-  min: 0.1
-  max: 0.9
+  min: 0.01
+  max: 0.99
 
 q_star:
   min: 0.01
   max: 0.99
+# Anchor level for the censoring times, drawn independently of q_star. Sharing
+# it pins P(C < T) near 1/2 whatever censoring_rate says. t_star stays shared,
+# so both distributions keep the same time unit.
+q_star_C:
+  min: 0.01
+  max: 0.99
+# Characteristic time scale; LogUniform (NumericalSampler kind=log_bounds).
 t_star:
   min: 0.01
   max: 100.0
+#max: 10000.0
+# Reject / redraw if max(T_obs) > t_max * t_star (keeps times on the anchor scale).
+t_max: 1000000000000
+time_max_tries: 50
+
+# Optional true survival curve per row (y keys t_grid, S) for --surv_target curve.
+save_surv_curve: false
+# Number of equidistant knots on [0, t_hi], including 0 (same meaning as the discrete n_grid).
+n_grid: 100
+# t_hi = surv_curve_window_mult * max observed time of the context rows (> 1 adds extrapolation).
+surv_curve_window_mult: 1.0
+
+# Administrative censoring. Independent switches, so both may fire and the
+# earliest cutoff wins.
+p_type1: 0.5                    # fixed horizon
+p_type2: 0.5                    # event-driven
+type1_quantile_bounds: [0.1, 0.9]
+type2_quantile_bounds: [0.1, 0.9]
+#type1_quantile_bounds: [0.01, 0.99]
+#type2_quantile_bounds: [0.01, 0.99]
+
+# Staggered entry: subject i is followed for r_i * tau, r_i = 1 - a * U^(1/k), so the
+# cutoff spreads over an interval instead of tying every still-at-risk subject
+# at one time. Probability 0 recovers the shared-cutoff behaviour.
+p_stagger_entry: 0.75
+accrual_frac_bounds: [0.0, 1.0]   # a: enrolment window, 1 - a is the minimum follow-up
+accrual_shape_bounds: [0.2, 1.0]  # k: 1 uniform accrual, < 1 mass near full follow-up
+
+# Random censoring switch: off means C = +inf (admin-only / uncensored datasets).
+p_random: 0.95
+
+# Probability that censoring is covariate-independent (eta_C exactly zero).
+p_cov_indep_cens: 0.25
+# Probability of informative censoring (SCM sibling η_C). Remainder → covdep non-info.
+# Exclusive: p_cov_indep_cens + p_informative_cens ≤ 1.
+p_informative_cens: 0.0
 
 bounds:
   weibull:

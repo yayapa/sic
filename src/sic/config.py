@@ -40,7 +40,8 @@ HEAD_SPECS = {
     "DeepHit100": {"surv_model_type": "deephit", "num_bins": 100, "filename": "DeepHit100_paper.ckpt"},
     "CoxPH": {"surv_model_type": "coxph", "num_bins": 1, "filename": "CoxPH.ckpt"},
     "DeepEH": {"surv_model_type": "deepeh", "num_bins": 2, "filename": "DeepEH.ckpt"},
-    # Continuous-time SuMo++ head; num_bins is unused by the head (kept = 1).
+    # Continuous-time SuMo (MrHuff) and SuMo++ (MONDE+); num_bins unused (kept = 1).
+    "SuMo": {"surv_model_type": "sumo", "num_bins": 1, "filename": "SuMo.ckpt"},
     "SuMoPP": {"surv_model_type": "sumo_pp", "num_bins": 1, "filename": "SuMoPP.ckpt"},
 }
 

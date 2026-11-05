@@ -40,7 +40,8 @@ from sic.train.survUtils import (
     sum_concordant_antolini, d_calibration,
 )
 from sic.model.sumo_utils import (
-    nll_loss, bce_loss, combo_bce_loss, predict_surv_sumo, compute_t_scale,
+    nll_loss, bce_loss, combo_bce_loss, predict_surv_sumo, compute_time_norm,
+    true_targets, curve_ce_loss, CONTINUOUS_SURV_TYPES,
 )
 from pycox.models.loss import DeepHitSingleLoss
 from pycox.preprocessing.label_transforms import LabTransDiscreteTime
@@ -61,6 +62,17 @@ class Timer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.elapsed = timeit.default_timer() - self.start_time
         return False  # Don't suppress exceptions
+
+
+def _split_batch_item(t, size: int):
+    """torch.split along datasets; survival targets are a dict of tensors, split per key."""
+    if isinstance(t, dict):
+        return [dict(zip(t, parts)) for parts in zip(*(torch.split(v, size, dim=0) for v in t.values()))]
+    return torch.split(t, size, dim=0)
+
+
+def _has_nan(y) -> bool:
+    return any(torch.isnan(v).any() for v in y.values()) if isinstance(y, dict) else bool(torch.isnan(y).any())
 
 
 def ddp_cleanup(func):
@@ -225,6 +237,8 @@ class Trainer:
             "mode": self.config.mode,
             "num_bins": self.config.num_bins,
             "surv_model_type": self.config.surv_model_type,
+            "sumo_tscale_q": self.config.sumo_tscale_q,
+            "cens_head": self.config.cens_head,
         }
 
         model = TabICL(**self.model_config)
@@ -491,9 +505,8 @@ class Trainer:
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         checkpoint_path = os.path.join(self.config.checkpoint_dir, name)
         config = dict(self.model_config)
-        if self.config.surv_model_type == "sumo_pp":
-            # Record the time-scale rule so inference reproduces the training
-            # scaling; api.py pops it back out (it is not a TabICL argument).
+        if self.config.surv_model_type in CONTINUOUS_SURV_TYPES:
+            # Already in model_config; keep explicit for older readers of the ckpt.
             config["sumo_tscale_q"] = self.config.sumo_tscale_q
         checkpoint = {
             "config": config,
@@ -679,12 +692,12 @@ class Trainer:
 
                 S = predict_surv_new_times_deephit(S, time_grid_old, time_grid_new)
 
-            elif self.config.surv_model_type == "sumo_pp":
+            elif self.config.surv_model_type in CONTINUOUS_SURV_TYPES:
                 res = self.model(X, y_train)
                 emb_test = res["emb_test"].squeeze(0)        # (Tq, d_model)
                 head = res["sumo_head"]
                 time_grid_t = torch.tensor(time_grid, device=emb_test.device, dtype=emb_test.dtype)
-                t_scale = compute_t_scale(T_train, self.config.sumo_tscale_q)
+                t_scale = compute_time_norm(T_train, self.config.sumo_tscale_q)
                 S = predict_surv_sumo(emb_test, time_grid_t, head, t_scale=t_scale)
 
             S = S.detach().cpu().numpy()
@@ -780,7 +793,10 @@ class Trainer:
         # Truncate sequence length
         if micro_X.shape[1] > seq_len:
             micro_X = micro_X[:, :seq_len]
-        if micro_y.shape[2] > seq_len:
+        if isinstance(micro_y, dict):
+            # Row-indexed keys are (B, L[, G]); t_grid is per dataset and keeps its length.
+            micro_y = {k: v if k == "t_grid" else v[:, :seq_len] for k, v in micro_y.items()}
+        elif micro_y.shape[2] > seq_len:
             micro_y = micro_y[:, :, :seq_len]
 
         # Truncate feature dimension
@@ -836,21 +852,41 @@ class Trainer:
 
         # Move to device
         micro_X = micro_X.to(self.config.device)
-        micro_y = micro_y.to(self.config.device)
+        micro_y = (
+            {k: v.to(self.config.device) for k, v in micro_y.items()}
+            if isinstance(micro_y, dict) else micro_y.to(self.config.device)
+        )
         micro_d = micro_d.to(self.config.device)
             
         micro_results = {}
 
-        if torch.isnan(micro_X).any() or torch.isnan(micro_y).any():
+        if torch.isnan(micro_X).any() or _has_nan(micro_y):
             return None
 
         if self.config.mode == "survival":
-            # y is (B,2,T)
-            T = micro_y[:, 0, :]
-            E = micro_y[:, 1, :]
-            
+            T = micro_y["T_obs"]
+            E = micro_y["E"]
+
             E_train, E_test = E[:, :train_size], E[:, train_size:]
             T_train, T_test = T[:, :train_size], T[:, train_size:]  # kept for future support-conditioning if needed
+            if self.config.surv_target == "true":
+                if "T_event" not in micro_y:
+                    raise ValueError(
+                        "surv_target='true' needs y with T_event and T_cens; "
+                        f"got keys {sorted(micro_y)}. Regenerate the prior data."
+                    )
+                T_event_test = micro_y["T_event"][:, train_size:]
+                T_cens_test = micro_y["T_cens"][:, train_size:]
+            elif self.config.surv_target == "curve":
+                if "S" not in micro_y:
+                    raise ValueError(
+                        "surv_target='curve' needs survival curves (y keys S, t_grid); "
+                        "regenerate the prior with save_surv_curve: true."
+                    )
+                if self.config.surv_loss not in ("nll", "bce", "combo_bce"):
+                    raise ValueError("surv_target='curve' is only implemented for the SuMo/SuMo++ heads")
+                S_test = micro_y["S"][:, train_size:]
+                t_grid = micro_y["t_grid"]
             
             B       = micro_X.shape[0]
             seq_len = micro_X.shape[1]              # already aligned by align_micro_batch
@@ -873,7 +909,8 @@ class Trainer:
 
             with self.amp_ctx:
                 # 1) forward: model returns dict with query slice
-                y_train = micro_y[:, :, :train_size]
+                # Observed channels only: true times must never enter the context.
+                y_train = torch.stack([T_train, E_train], dim=1)
                 
                 out = self.model(micro_X, y_train, micro_d)
 
@@ -985,8 +1022,7 @@ class Trainer:
                     else:
                         loss = log_hazard.sum() * 0.0
                 elif self.config.surv_loss in ("nll", "bce", "combo_bce"):
-                    # sumo_pp continuous head. Per task: build the loss from the
-                    # query embeddings, the head, and the task's t_scale.
+                    # Continuous SuMo / SuMo++ head. Per task: embeddings + head + time norm.
                     head = out["sumo_head"]
                     if self.config.surv_loss == "nll":
                         _loss_fn = nll_loss
@@ -998,6 +1034,8 @@ class Trainer:
                             bce_weight=self.config.bce_weight,
                             sigma_frac=self.config.bce_sigma,
                         )
+                    cens_head = out.get("cens_head")
+                    use_true = self.config.surv_target == "true"
                     loss = tensor(0.0, device=self.config.device)
                     B_eff = 0
                     for b in range(B):
@@ -1007,8 +1045,21 @@ class Trainer:
                         if Tb.numel() == 0:
                             continue
                         try:
-                            t_scale = compute_t_scale(T_train[b], self.config.sumo_tscale_q)
-                            ll = _loss_fn(head, Xb, Tb, Eb, t_scale=t_scale)
+                            t_scale = compute_time_norm(T_train[b], self.config.sumo_tscale_q)
+                            if use_true:
+                                mult = self.config.true_tau_mult
+                                tau = mult * T_train[b].max() if 0 < mult < float("inf") else float("inf")
+                                Tb, Eb = true_targets(T_event_test[b], tau)
+                                if cens_head is not None:
+                                    Tc, Ec = true_targets(T_cens_test[b], tau)
+                            elif cens_head is not None:
+                                Tc, Ec = Tb, 1.0 - Eb
+                            if self.config.surv_target == "curve":
+                                ll = curve_ce_loss(head, Xb, t_grid[b], S_test[b], t_scale=t_scale)
+                            else:
+                                ll = _loss_fn(head, Xb, Tb, Eb, t_scale=t_scale)
+                            if cens_head is not None:
+                                ll = ll + self.config.cens_loss_weight * _loss_fn(cens_head, Xb, Tc, Ec, t_scale=t_scale)
                         except Exception as ex:
                             print("SuMo loss computation error:", ex)
                             continue
@@ -1089,7 +1140,7 @@ class Trainer:
                         elif self.config.surv_loss in ("nll", "bce", "combo_bce"):
                             head = out["sumo_head"]
                             try:
-                                t_scale = compute_t_scale(T_train[b], self.config.sumo_tscale_q)
+                                t_scale = compute_time_norm(T_train[b], self.config.sumo_tscale_q)
                                 S_b = predict_surv_sumo(
                                     out["emb_test"][b],
                                     torch.tensor(time_grid, device=self.config.device, dtype=out["emb_test"][b].dtype),
@@ -1218,11 +1269,11 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         # Pad nested tensors to the same size
-        batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
+        batch = [t.to_padded_tensor(padding=0.0) if torch.is_tensor(t) and t.is_nested else t for t in batch]
 
         # Split the batch into micro-batches along the first dimension
         num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
-        micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
+        micro_batches = [_split_batch_item(t, self.config.micro_batch_size) for t in batch]
         micro_batches = list(zip(*micro_batches))
 
         if self.config.mode == "survival":
@@ -1242,7 +1293,7 @@ class Trainer:
             skip_computation = False
 
             micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
-            if torch.isnan(micro_X).any() or torch.isnan(micro_y).any():
+            if torch.isnan(micro_X).any() or _has_nan(micro_y):
                 skip_computation = True
                 if self.master_process:
                     print(f"Warning: NaNs detected in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
@@ -1311,14 +1362,18 @@ def main(argv: list[str] | None = None):
     parser = build_parser()
     config = parser.parse_args(argv)
 
-    # The continuous sumo_pp head and its losses only work as a pair; catch a
-    # mismatch here instead of an opaque error deep inside the training step.
-    sumo_losses = ("nll", "bce", "combo_bce")
-    if (config.surv_model_type == "sumo_pp") != (config.surv_loss in sumo_losses):
+    # Continuous SuMo / SuMo++ heads and their losses only work as a pair.
+    if config.surv_model_type == "sumo":
+        if config.surv_loss != "nll":
+            parser.error("--surv_model_type sumo requires --surv_loss nll")
+    elif config.surv_model_type == "sumo_pp":
+        if config.surv_loss not in ("nll", "bce", "combo_bce"):
+            parser.error(
+                "--surv_model_type sumo_pp requires --surv_loss in nll/bce/combo_bce"
+            )
+    elif config.surv_loss in ("nll", "bce", "combo_bce"):
         parser.error(
-            f"--surv_model_type {config.surv_model_type} is incompatible with "
-            f"--surv_loss {config.surv_loss}: the sumo_pp head requires one of "
-            f"{'/'.join(sumo_losses)}, and those losses require sumo_pp."
+            f"--surv_loss {config.surv_loss} requires --surv_model_type sumo or sumo_pp"
         )
 
     try:

@@ -73,35 +73,38 @@ surv = model.fit_predict_surv(
 
 Everything you need to know about running the model is in the example notebooks:
 
-- `examples/sic_walkthrough.ipynb` - notebook tour of SIC: raw outputs, calibrated curves, the metric suite, and CV results.
-- `examples/sic_head_comparison.ipynb` - cross-validate all heads on every dataset; grouped C-index / IBS bar plots and a miscalibrated-folds heatmap, datasets sorted by sample size.
-- `examples/inspect_prior_batch.ipynb` - load one synthetic prior batch and plot Kaplan–Meier curves and event times.
+- `examples/sic_walkthrough.ipynb` - notebook tour of SIC (SuMoPP): the `cindex_td` / `ibs_q90` evaluation grids, survival curves, and 5-fold CV with CSV/JSON output.
+- `examples/inspect_prior_batch.ipynb` - load one synthetic prior batch: Kaplan–Meier curves, event / censoring times, the censoring regimes, and a Cox PH sanity check.
 
 ### Survival heads
 
-SIC is not survival-head independent. The default is the `DeepHit10` head. We also have other head checkpoints one may want to try:
+SIC uses the `SuMoPP` (SuMo++) head by default: a continuous-time head whose survival curve S(t|x) is monotone in t with S(0)=1, with time scaled by the p95 of the training durations. Its checkpoint is released and downloads automatically.
 
-| `survival_head`                              | model                 | output                                             |
-| ---------------------------------------------- | --------------------- | -------------------------------------------------- |
-| `DeepHit10` / `DeepHit50` / `DeepHit100` | discrete-time DeepHit | 10 / 50 / 100 bins                                 |
-| `CoxPH`                                      | proportional hazards  | 1 log-hazard / subject                             |
-| `DeepEH`                                     | extended hazard       | 2 hazards / subject                                |
-| `SuMoPP`                                     | SuMo++ (MONDE+)       | continuous S(t,x); monotone in t with S(0)=1 exact |
+You can also train SIC with other survival heads (see [Generating Prior and training your own model](#generating-prior-and-training-your-own-model)). **We do not provide checkpoints for these heads yet.**
 
-### Post-training calibration
+| `survival_head`      | model                 | output                                             | training script          |
+| -------------------- | --------------------- | -------------------------------------------------- | ------------------------ |
+| `SuMoPP` (default)   | SuMo++ (MONDE+)       | continuous S(t,x); monotone in t with S(0)=1 exact | `run_train_sumopp.sh`    |
+| `SuMo`               | SuMo-net (MrHuff)     | continuous S(t,x); mixed monotone-in-t             | `run_train_sumo.sh`      |
+| `CoxPH`              | proportional hazards  | 1 log-hazard / subject                             | `run_train_coxph.sh`     |
+| `DeepEH`             | extended hazard       | 2 hazards / subject                                | `run_train_deepeh.sh`    |
+| `DeepHit10`          | discrete-time DeepHit | 10 bins                                            | `run_train_deephit10.sh` |
 
-We found that the post-training calibration methods [CiPOT](https://arxiv.org/pdf/2410.20579v3) and [CSD](https://arxiv.org/pdf/2405.07374) may be beneficial for improving IBS and D-calibration while retaining C-index performance:
-
-```python
-surv = model.fit_predict_surv(
-    X_train, y_train, X_test, eval_times=times,
-    post_training_calibration="cipot",   # or "csd"
-)
-```
+To use a head you trained yourself, pass its checkpoint: `SIC(survival_head="SuMo", model_path="/path/to/step-10000.ckpt")`.
 
 ## Benchmarking
 
-`sic.list_datasets()` returns the supported benchmarks. Real data is obtained without manual setup: some datasets are auto-downloaded by `pycox`, others ship with `scikit-survival` / `lifelines`, and a few small ones are bundled as CSVs. The restricted-access SEER and UNOS datasets are not included.
+`sic.list_datasets()` returns the benchmark: all [SurvSet](https://github.com/ErikinBC/SurvSet) datasets (55, smallest first), METABRIC (bundled with the package), and SEER / UNOS if available. The SurvSet datasets need the optional extra:
+
+```bash
+pip install -e ".[survset]"
+bash examples/run_eval_survset.sh                 # whole benchmark, released SuMoPP weights
+python examples/run_eval_survset.py --model_path /path/to/model.ckpt --datasets hdfail METABRIC
+```
+
+Both write the per-fold metrics to `.xlsx` and `.json`. `cindex_td` is computed on the unique test times and `ibs_q90` on 100 points from the first training event time to the 90th percentile of the training durations (see `sic.horizons`).
+
+The restricted-access SEER and UNOS datasets are not distributed. If you have access, put `seernfg.csv` / `unos.csv` in a folder and pass `--data_dir` (or set `SIC_DATA_DIR`); they are then added to the benchmark automatically.
 
 ## Generating Prior and training your own model
 
@@ -110,12 +113,12 @@ See `examples/` for scripts and notebooks. Workflow:
 ```bash
 bash examples/run_genload_continuous.sh   # synthetic continuous priors
 bash examples/run_genload_discrete.sh     # synthetic discrete priors
-bash examples/run_train_mix.sh            # train on a mix (run genload first)
+bash examples/run_train_sumopp.sh         # train the default SuMoPP head (run genload first)
 ```
 
-Edit paths and hyperparameters at the top of each script. Inspect a prior batch: `examples/inspect_prior_batch.ipynb`.
+Other heads: `run_train_sumo.sh`, `run_train_deephit10.sh`, `run_train_deepeh.sh`, `run_train_coxph.sh`. Edit paths and hyperparameters at the top of each script (or export `DATA_ROOT`, `CHECKPOINT_ROOT`, `CHECKPOINT_PATH`). Inspect a prior batch: `examples/inspect_prior_batch.ipynb`.
 
-**wandb:** `run_train_mix.sh` logs to [wandb](https://wandb.ai) by default (`--wandb_mode online`). Set `WANDB_API_KEY` or run `wandb login` (requires **wandb ≥ 0.22.3** for current API keys). Use `--wandb_mode offline` or `--wandb_log False` to skip cloud logging.
+**wandb:** the training scripts log to [wandb](https://wandb.ai) by default (`--wandb_mode online`). Set `WANDB_API_KEY` or run `wandb login` (requires **wandb ≥ 0.22.3** for current API keys). Use `--wandb_mode offline` or `--wandb_log False` to skip cloud logging.
 
 ## Baselines
 
