@@ -28,6 +28,7 @@ import time
 import json
 import warnings
 import argparse
+import shutil
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, List
@@ -192,6 +193,17 @@ def cat_slice_nested_tensors(tensors: List, dim=0) -> SliceNestedTensor:
     return SliceNestedTensor(torch.cat(nested_tensors, dim=dim))
 
 
+def _cat_y(a, b):
+    """Concatenate targets along the dataset dim; survival targets are dicts of tensors."""
+    if isinstance(a, dict):
+        return {k: torch.cat([a[k], b[k]], dim=0) for k in a}
+    return torch.cat([a, b], dim=0)
+
+
+def _take_y(y, sl: slice):
+    return {k: v[sl] for k, v in y.items()} if isinstance(y, dict) else y[sl]
+
+
 class LoadPriorDataset(IterableDataset):
     """Loads pre-generated prior data sequentially for distributed training.
 
@@ -289,7 +301,10 @@ class LoadPriorDataset(IterableDataset):
 
         batch = torch.load(batch_file, map_location=self.device, weights_only=True)
         X = batch["X"]
-        y = batch["y"] 
+        y = batch["y"]
+        if not isinstance(y, dict) and not y.is_nested and y.ndim == 3:
+            # Survival data saved before targets became a dict: channels (T_obs, E[, T_event, T_cens]).
+            y = dict(zip(("T_obs", "E", "T_event", "T_cens"), y.unbind(1)))
         d = batch["d"]
         seq_lens = batch["seq_lens"]
         train_sizes = batch["train_sizes"]
@@ -337,6 +352,12 @@ class LoadPriorDataset(IterableDataset):
         if self.buffer_size == 0:
             # Load the first batch
             X, y, d, seq_lens, train_sizes, file_batch_size = self._load_batch_file()
+            if not isinstance(X, SliceNestedTensor) and file_batch_size % self.batch_size != 0:
+                # Dense files have their own seq_len, train_size and feature width, so they cannot be merged.
+                raise ValueError(
+                    f"batch_size={self.batch_size} must divide the saved file batch size ({file_batch_size}) "
+                    f"in {self.data_dir}; datasets from different files cannot share one batch."
+                )
             self.buffer_X = X
             self.buffer_y = y
             self.buffer_d = d
@@ -371,7 +392,7 @@ class LoadPriorDataset(IterableDataset):
                         self.buffer_y = cat_slice_nested_tensors([self.buffer_y, y], dim=0)
                     else:
                         self.buffer_X = torch.cat([self.buffer_X, X], dim=0)
-                        self.buffer_y = torch.cat([self.buffer_y, y], dim=0)
+                        self.buffer_y = _cat_y(self.buffer_y, y)
 
                     self.buffer_d = torch.cat([self.buffer_d, d], dim=0)
                     self.buffer_seq_lens = torch.cat([self.buffer_seq_lens, seq_lens], dim=0)
@@ -387,7 +408,7 @@ class LoadPriorDataset(IterableDataset):
 
         # Prepare output
         X_out = self.buffer_X[:output_size]
-        y_out = self.buffer_y[:output_size]
+        y_out = _take_y(self.buffer_y, slice(None, output_size))
         d_out = self.buffer_d[:output_size]
         seq_lens_out = self.buffer_seq_lens[:output_size]
         train_sizes_out = self.buffer_train_sizes[:output_size]
@@ -395,7 +416,7 @@ class LoadPriorDataset(IterableDataset):
         # Update buffer with remaining data
         if output_size < self.buffer_size:
             self.buffer_X = self.buffer_X[output_size:]
-            self.buffer_y = self.buffer_y[output_size:]
+            self.buffer_y = _take_y(self.buffer_y, slice(output_size, None))
             self.buffer_d = self.buffer_d[output_size:]
             self.buffer_seq_lens = self.buffer_seq_lens[output_size:]
             self.buffer_train_sizes = self.buffer_train_sizes[output_size:]
@@ -517,6 +538,28 @@ class MixedLoadPriorDataset(IterableDataset):
         )
 
 
+# Per-dataset censoring regime record saved next to cov_indep_cens; read by
+# scripts/audit_prior_nan_events.py. Keys missing from a dataset's meta are NaN.
+CENSORING_META_BOOL_KEYS = (
+    "random_cens", "admin_type1", "admin_type2",
+    "type1_bound", "type2_bound", "type2_reached", "stagger_entry",
+)
+CENSORING_META_FLOAT_KEYS = (
+    "C", "q_type1", "C_percent", "type2_d",
+    "accrual_frac", "accrual_shape", "r_mean",
+    "random_cens_frac", "admin_cens_frac", "event_frac",
+)
+
+
+def censoring_meta_tensors(sampled_params_list) -> dict:
+    """Stack the scalar censoring fields of each dataset's meta into (B,) tensors."""
+    metas = [p or {} for p in sampled_params_list]
+    out = {k: torch.tensor([bool(m.get(k, False)) for m in metas]) for k in CENSORING_META_BOOL_KEYS}
+    for k in CENSORING_META_FLOAT_KEYS:
+        out[k] = torch.tensor([float(m.get(k, float("nan"))) for m in metas], dtype=torch.float32)
+    return out
+
+
 class SavePriorDataset:
     """Generates and saves batches of prior datasets to disk.
 
@@ -578,8 +621,12 @@ class SavePriorDataset:
         }
         with open(self.save_dir / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
+        # Keep the exact prior configs next to the data they generated.
+        for cfg in (getattr(self.args, "reg2surv_config", None), getattr(self.args, "reg2surv_discrete_config", None)):
+            if cfg is not None:
+                shutil.copy2(cfg, self.save_dir / Path(cfg).name)
 
-    def save_batch_sparse(self, batch_idx, X, y, d, seq_lens, train_sizes):
+    def save_batch_sparse(self, batch_idx, X, y, d, seq_lens, train_sizes, cov_indep_cens=None, censoring_meta=None):
         """Save batch data in sparse format for efficient storage.
 
         This method handles the conversion between dense and sparse tensor formats
@@ -607,6 +654,12 @@ class SavePriorDataset:
 
         train_sizes : torch.Tensor
             Position at which to split training and evaluation data
+
+        cov_indep_cens : torch.Tensor, optional
+            Per-dataset bool flag, True if censoring is covariate-independent
+
+        censoring_meta : dict[str, torch.Tensor], optional
+            Per-dataset censoring regime record (see CENSORING_META_KEYS)
         """
         save_dir_batch_data = self.save_dir / "batch_data"
         save_dir_batch_data.mkdir(parents=True, exist_ok=True)
@@ -620,10 +673,12 @@ class SavePriorDataset:
         # Create temporary file first
         batch_file = save_dir_batch_data / f"batch_{batch_idx:06d}.pt"
         temp_file = save_dir_batch_data / f"batch_{batch_idx:06d}.pt.tmp"
-        torch.save(
-            {"X": X, "y": y, "d": d, "seq_lens": seq_lens, "train_sizes": train_sizes, "batch_size": B},
-            temp_file,
-        )
+        payload = {"X": X, "y": y, "d": d, "seq_lens": seq_lens, "train_sizes": train_sizes, "batch_size": B}
+        if cov_indep_cens is not None:
+            payload["cov_indep_cens"] = cov_indep_cens
+        if censoring_meta is not None:
+            payload["censoring_meta"] = censoring_meta
+        torch.save(payload, temp_file)
         # Atomic rename to ensure file integrity
         temp_file.replace(batch_file)
     def save_sampled_params(self, batch_idx, sampled_params_to_save_list):
@@ -712,15 +767,23 @@ class SavePriorDataset:
             X, y, d, seq_lens, train_sizes, sampled_params_to_save_list = self.prior.get_batch()
             # Move tensors to CPU before saving
             X = X.cpu()
-            y = y.cpu()
+            y = {k: v.cpu() for k, v in y.items()} if isinstance(y, dict) else y.cpu()
             #y = (y[0].cpu(), y[1].cpu()) if self.args.reg2surv else y.cpu()
             
             d = d.cpu()
             seq_lens = seq_lens.cpu()
             train_sizes = train_sizes.cpu()
-            if self.args.reg2surv:
+            # main() sets reg2surv=False for the discrete prior, so check both flags.
+            if self.args.reg2surv or getattr(self.args, "reg2surv_discrete", False):
                 #self.save_batch_sparse_surv(batch_idx, X, y, d, seq_lens, train_sizes)
-                self.save_batch_sparse(batch_idx, X, y, d, seq_lens, train_sizes)
+                cov_indep_cens = torch.tensor(
+                    [bool(p.get("cov_indep_cens", False)) if p else False for p in sampled_params_to_save_list]
+                )
+                self.save_batch_sparse(
+                    batch_idx, X, y, d, seq_lens, train_sizes,
+                    cov_indep_cens=cov_indep_cens,
+                    censoring_meta=censoring_meta_tensors(sampled_params_to_save_list),
+                )
                 #self.save_sampled_params(batch_idx, sampled_params_to_save_list)
             else:
                 self.save_batch_sparse(batch_idx, X, y, d, seq_lens, train_sizes)
@@ -844,6 +907,8 @@ def main(argv: list[str] | None = None):
             "n_event_layers_bounds", "event_layer_bounds",
             "n_cens_layers_bounds", "cens_layer_bounds",
             "t_max_bounds", "censoring_rate_bounds",
+            "type1_quantile_bounds", "type2_quantile_bounds",
+            "accrual_frac_bounds", "accrual_shape_bounds",
         ):
             if key in reg2surv_discrete_param and isinstance(reg2surv_discrete_param[key], list):
                 reg2surv_discrete_param[key] = tuple(reg2surv_discrete_param[key])

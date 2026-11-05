@@ -4,7 +4,7 @@ Amortized Bayesian survival analysis via prior-fitted networks. The headline
 entry point is the :class:`SIC` estimator::
 
     from sic import SIC
-    surv = SIC(survival_head="DeepHit10").fit_predict_surv(X_train, y_train, X_test)
+    surv = SIC().fit_predict_surv(X_train, y_train, X_test)
 """
 
 from .__about__ import __version__

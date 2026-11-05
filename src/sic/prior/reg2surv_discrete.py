@@ -19,7 +19,7 @@ hp if that key is absent):
     event_layer_bounds     : (lo, hi), uniform int, inclusive
     n_cens_layers_bounds   : (lo, hi), uniform int, inclusive
     cens_layer_bounds      : (lo, hi), uniform int, inclusive
-    t_max_bounds           : (lo, hi), uniform
+    t_max_bounds           : (lo, hi), log-uniform (requires lo > 0)
     censoring_rate_bounds  : (lo, hi), uniform
 
 Optional independent bounds for the censoring net (fall back to the event-net
@@ -44,6 +44,16 @@ from typing import List, Tuple
 import numpy as np
 import torch
 from torch import nn, Tensor
+
+from .admin_censoring import apply_admin_censoring, sample_follow_up_fractions
+from .censoring_eta import (
+    DEP_COVDEP,
+    DEP_INDEP,
+    DEP_INFO,
+    eta_c_from_x,
+    sample_censoring_dependence,
+)
+from .prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 
 EPS = 1e-6
 
@@ -155,7 +165,7 @@ def compute_survival(net: nn.Sequential, eta: Tensor, t_grid: Tensor) -> Tensor:
     inp = torch.cat([eta_exp, t_exp], dim=1)
     f = net(inp).reshape(N, G)
     f0, fG = f[:, 0:1], f[:, -1:]
-    S = ((fG - f) / (fG - f0 + EPS)).clamp(0.0, 1.0)
+    S = ((fG - f) / (fG - f0)).clamp(0.0, 1.0) # EPS removed otherwise T can be 0
     return S
 
 
@@ -235,6 +245,10 @@ class Reg2SurvDiscrete(nn.Module):
             self._g.manual_seed(int(seed))
         # numpy RNG -> Beta / Gamma draws (torch.distributions doesn't accept generators).
         self._np = np.random.default_rng(None if seed is None else int(seed))
+        # Same SCM HP families as the event prior (threaded from SCMPrior).
+        self.scm_sampled_hp = DEFAULT_SAMPLED_HP
+        self.scm_fixed_hp = DEFAULT_FIXED_HP
+        self.scm_prior_type = "mlp_scm"
 
     # ------------------------------------------------------------------
     # Per-dataset hyper-parameter sampling
@@ -245,6 +259,15 @@ class Reg2SurvDiscrete(nn.Module):
 
         def _u(lo, hi):
             return lo + (hi - lo) * float(torch.rand((), generator=g, device=self.device).cpu().item())
+
+        def _log_u(lo, hi):
+            # Log-uniform on (lo, hi); matches NumericalSampler kind=log_bounds.
+            lo, hi = float(lo), float(hi)
+            if not (lo > 0.0 and hi > lo):
+                raise ValueError(f"log-uniform requires 0 < lo < hi, got lo={lo}, hi={hi}")
+            u = float(torch.rand((), generator=g, device=self.device).cpu().item())
+            u = min(max(u, EPS), 1.0 - EPS)
+            return math.exp(math.log(lo) + u * (math.log(hi) - math.log(lo)))
 
         def _randint(lo, hi):
             # inclusive both ends; if lo == hi we'd still like to draw lo.
@@ -274,22 +297,52 @@ class Reg2SurvDiscrete(nn.Module):
         gamma_k_c = _u(*h.get("gamma_k_cens_bounds", h["gamma_k_bounds"]))
         lo_mu_t_c, hi_mu_t_c = h.get("mu_t_cens_bounds", h["mu_t_bounds"])
         mu_t_c = _u(lo_mu_t_c + EPS, hi_mu_t_c - EPS)
-        # cens net has fan_in = 1 -> no eta columns; draw only for API symmetry.
-        _ = _vec_u(0, *h.get("lambda_eta_cens_bounds", h["lambda_eta_bounds"]))
+        # Ternary dependence: indep / info / covdep (remainder).
+        # indep → λ_ηc = 0; covdep → η_C = f(X) later; info → SCM sibling η.
+        dep = sample_censoring_dependence(
+            float(h.get("p_cov_indep_cens", 0.25)),
+            float(h.get("p_informative_cens", 0.0)),
+            rng=g,
+            device=self.device,
+        )
+        cov_indep_cens = dep == DEP_INDEP
+        if cov_indep_cens:
+            lambda_eta_c = torch.zeros(n_etas, device=self.device)
+        else:
+            lambda_eta_c = _vec_u(n_etas, *h.get("lambda_eta_cens_bounds", h["lambda_eta_bounds"]))
 
         n_cs = _randint(*h["n_cens_layers_bounds"])
         cens_layers = [_randint(*h["cens_layer_bounds"]) for _ in range(n_cs)]
 
         # ---- Shared scalars (one draw used for both T and C) ----
-        t_max = _u(*h["t_max_bounds"])
-        C_pct = _u(*h["censoring_rate_bounds"])
+        t_max = _log_u(*h["t_max_bounds"])
+        C_pct = _u(*h.get("type2_quantile_bounds", h["censoring_rate_bounds"]))
+
+        # ---- Random censoring switch: off means C = +inf ----
+        use_random = _u(0.0, 1.0) < float(h.get("p_random", 1.0))
+
+        # ---- Administrative censoring branches (independent switches) ----
+        use_type1 = _u(0.0, 1.0) < float(h.get("p_type1", 0.0))
+        use_type2 = _u(0.0, 1.0) < float(h.get("p_type2", 0.0))
+        q_type1 = _u(*h.get("type1_quantile_bounds", (0.05, 0.95)))
+
+        # ---- Staggered entry: subject i is followed for r_i * tau ----
+        use_stagger = _u(0.0, 1.0) < float(h.get("p_stagger_entry", 1.0))
+        accrual_frac = _u(*h.get("accrual_frac_bounds", (0.0, 1.0)))
+        accrual_shape = _u(*h.get("accrual_shape_bounds", (0.2, 1.0)))
 
         return dict(
             alpha=alpha, gamma_k=gamma_k, mu_t=mu_t, lambda_eta=lambda_eta,
             event_layers=event_layers,
             alpha_c=alpha_c, gamma_k_c=gamma_k_c, mu_t_c=mu_t_c,
+            lambda_eta_c=lambda_eta_c, cov_indep_cens=cov_indep_cens,
+            censoring_dependence=dep,
             cens_layers=cens_layers,
             t_max=t_max, C_pct=C_pct,
+            use_random=use_random,
+            use_type1=use_type1, use_type2=use_type2, q_type1=q_type1,
+            use_stagger=use_stagger,
+            accrual_frac=accrual_frac, accrual_shape=accrual_shape,
         )
     # for testing diffetent fixed hyperparameters
     def _sample_hypers_2(self, n_etas: int) -> dict:
@@ -298,6 +351,14 @@ class Reg2SurvDiscrete(nn.Module):
 
         def _u(lo, hi):
             return lo + (hi - lo) * float(torch.rand((), generator=g).item())
+
+        def _log_u(lo, hi):
+            lo, hi = float(lo), float(hi)
+            if not (lo > 0.0 and hi > lo):
+                raise ValueError(f"log-uniform requires 0 < lo < hi, got lo={lo}, hi={hi}")
+            u = float(torch.rand((), generator=g).item())
+            u = min(max(u, EPS), 1.0 - EPS)
+            return math.exp(math.log(lo) + u * (math.log(hi) - math.log(lo)))
 
         def _randint(lo, hi):
             # inclusive both ends; if lo == hi we'd still like to draw lo.
@@ -326,22 +387,24 @@ class Reg2SurvDiscrete(nn.Module):
         alpha_c = alpha
         gamma_k_c = gamma_k
         mu_t_c = mu_t
-        # cens net has fan_in = 1 -> no eta columns; draw only for API symmetry.
-        _ = 0.0
+        lambda_eta_c = torch.zeros(n_etas)
 
         n_cs = 1
         cens_layers = [8]
 
         # ---- Shared scalars (one draw used for both T and C) ----
-        t_max = _u(*h["t_max_bounds"])
+        t_max = _log_u(*h["t_max_bounds"])
         C_pct = _u(*h["censoring_rate_bounds"])
 
         return dict(
             alpha=alpha, gamma_k=gamma_k, mu_t=mu_t, lambda_eta=lambda_eta,
             event_layers=event_layers,
             alpha_c=alpha_c, gamma_k_c=gamma_k_c, mu_t_c=mu_t_c,
+            lambda_eta_c=lambda_eta_c, cov_indep_cens=True,
+            censoring_dependence=DEP_INDEP,
             cens_layers=cens_layers,
             t_max=t_max, C_pct=C_pct,
+            use_type1=False, use_type2=True, q_type1=0.5,
         )
     # ------------------------------------------------------------------
     # Event net construction with optional rejection loop
@@ -386,15 +449,15 @@ class Reg2SurvDiscrete(nn.Module):
         return last_net
 
     # ------------------------------------------------------------------
-    # Contract-matching forward: (X, y) -> (X, (T_obs, E), meta)
+    # Contract-matching forward: (X, y) -> (X, {T_obs, E, T_event, T_cens[, t_grid, S]}, meta)
     # ------------------------------------------------------------------
     @torch.no_grad()
     def forward(
         self, X: Tensor, y: Tensor
-    ) -> Tuple[Tensor, Tuple[Tensor, Tensor], dict]:
+    ) -> Tuple[Tensor, dict, dict]:
         if y.ndim == 1:
             y = y.unsqueeze(-1)
-        N, M = y.shape
+        N, n_cols = y.shape
         dev, dt = self.device, self.dtype
 
         X = X.to(device=dev, dtype=dt)
@@ -405,58 +468,112 @@ class Reg2SurvDiscrete(nn.Module):
         sd = y.std(0, keepdim=True).clamp_min(1e-8)
         eta = ((y - mu) / sd).clamp(-5.0, 5.0)
 
+        # The sampler draws 2 * n_etas SCM outputs: first half = event η;
+        # second half = informative-censoring sibling. covdep ignores the
+        # sibling and builds η_C = f(X) instead; indep zeroes λ_ηc.
+        if n_cols >= 2 and n_cols % 2 == 0:
+            M = n_cols // 2
+            eta_event, eta_sibling = eta[:, :M], eta[:, M:]
+        else:
+            M = n_cols
+            eta_event = eta_sibling = eta
+
         # Regenerate if the observed times are degenerate (all equal / near-equal).
         last_payload = None
         max_tries = max(int(self._time_max_tries), 1)
         for _ in range(max_tries):
             hyp = self._sample_hypers(M)
+            dep = hyp.get("censoring_dependence", DEP_INDEP if hyp["cov_indep_cens"] else DEP_INFO)
+            if dep == DEP_INDEP:
+                eta_cens = torch.zeros_like(eta_event)
+            elif dep == DEP_COVDEP:
+                eta_cens = eta_c_from_x(
+                    X, M,
+                    prior_type=getattr(self, "scm_prior_type", "mlp_scm"),
+                    device=dev,
+                    dtype=dt,
+                    scm_sampled_hp=getattr(self, "scm_sampled_hp", None),
+                    scm_fixed_hp=getattr(self, "scm_fixed_hp", None),
+                )
+            else:
+                eta_cens = eta_sibling
+
             t_grid = torch.linspace(0.0, 1.0, self.hp["n_grid"], device=dev, dtype=dt)
 
             # ---- Event net ----
             event_net = self._build_event_net(M, hyp)
 
-            # ---- Censoring net (fan_in == 1, no eta) ----
-            cens_net = build_positive_network(1, hyp["cens_layers"]).to(dev, dtype=dt)
+            # ---- Censoring net (own eta channels, weights and scaling) ----
+            cens_net = build_positive_network(M + 1, hyp["cens_layers"]).to(dev, dtype=dt)
             random_init(
                 cens_net,
-                input_means=torch.tensor([hyp["mu_t_c"]], device=dev, dtype=dt),
+                input_means=torch.cat(
+                    [torch.zeros(M), torch.tensor([hyp["mu_t_c"]])]
+                ).to(device=dev, dtype=dt),
                 alpha=hyp["alpha_c"], gamma_k=hyp["gamma_k_c"],
-                lambda_eta=torch.empty(0),
+                lambda_eta=hyp["lambda_eta_c"],
                 np_rng=self._np,
             )
             cens_net.eval()
 
             # ---- Event survival & times ----
-            S_event = compute_survival(event_net, eta, t_grid)                 # (N, G)
+            S_event = compute_survival(event_net, eta_event, t_grid)           # (N, G)
             U = torch.empty(N, device=dev).uniform_(0.01, 0.99, generator=self._g).to(device=dev, dtype=dt)
-            T_norm = invert_survival(S_event, t_grid, U)
+            T_norm = invert_survival(S_event, t_grid, U)#.clamp_min(1e-8) # in 1% of dataset at least one Time is 0. To avoud this.
             T = T_norm * hyp["t_max"]
 
             # ---- Censoring survival & times ----
-            S_cens_1d = compute_survival_1d(cens_net, t_grid)                   # (G,)
-            S_cens = S_cens_1d.unsqueeze(0).expand(N, -1)
+            S_cens = compute_survival(cens_net, eta_cens, t_grid)               # (N, G)
             V = torch.empty(N, device=dev).uniform_(0.01, 0.99, generator=self._g).to(device=dev, dtype=dt)
             C_norm = invert_survival(S_cens, t_grid, V)
             C = C_norm * hyp["t_max"]
+            # The censoring net is still built when random censoring is off, so the RNG stream is unchanged.
+            if not hyp.get("use_random", True):
+                C = torch.full_like(C, float("inf"))
 
-            # ---- Admin censoring at quantile (1 - C_pct) of T ----
-            C_admin = torch.quantile(T, 1.0 - hyp["C_pct"])
+            # ---- Random censoring ----
             E = (T <= C).to(torch.int32)
             T_obs = torch.minimum(T, C)
-            E = E * (T_obs <= C_admin).to(torch.int32)
-            T_obs = torch.minimum(T_obs, C_admin)
+            random_cens_frac = float(1.0 - E.double().mean())
+
+            # ---- Administrative censoring: optional branches, earliest wins ----
+            # Staggered entry spreads the cutoff over [min(r) * C_admin, C_admin]
+            # instead of leaving every still-at-risk subject tied at one time.
+            use_admin = bool(hyp["use_type1"]) or bool(hyp["use_type2"])
+            stagger = use_admin and bool(hyp.get("use_stagger", False))
+            r_frac = (
+                sample_follow_up_fractions(
+                    self._np, N, hyp.get("accrual_frac", 0.0), hyp.get("accrual_shape", 1.0),
+                    device=dev, dtype=dt,
+                )
+                if stagger
+                else None
+            )
+            n_events_random = int(E.sum())
+            T_obs, E, C_admin, admin_info = apply_admin_censoring(
+                T_obs,
+                E,
+                T_event=T,
+                r=r_frac,
+                use_type1=bool(hyp["use_type1"]),
+                use_type2=bool(hyp["use_type2"]),
+                q_type1=hyp["q_type1"],
+                c_pct=hyp["C_pct"],
+            )
+            admin_info["random_cens_frac"] = random_cens_frac
+            admin_info["admin_cens_frac"] = (n_events_random - int(E.sum())) / N
 
             # Degeneracy check on observed times.
             # Use relative tolerance scaled by t_max to be robust across horizons.
             spread = (T_obs.max() - T_obs.min()).abs()
             eps = (self._time_min_spread_rel * float(hyp["t_max"])) + self._time_min_spread_abs
 
-            last_payload = (hyp, t_grid, S_event, T_obs, E, C_admin)
+            last_payload = (hyp, t_grid, S_event, T_obs, E, C_admin, r_frac, T, C, admin_info)
             if float(spread.detach().cpu().item()) > float(eps):
                 break
 
         assert last_payload is not None
-        hyp, t_grid, S_event, T_obs, E, C_admin = last_payload
+        hyp, t_grid, S_event, T_obs, E, C_admin, r_frac, T, C, admin_info = last_payload
 
         meta = {
             "mode": "discrete",
@@ -469,10 +586,26 @@ class Reg2SurvDiscrete(nn.Module):
             "alpha_c": float(hyp["alpha_c"]),
             "gamma_k_c": float(hyp["gamma_k_c"]),
             "mu_t_c": float(hyp["mu_t_c"]),
+            "lambda_eta_c": hyp["lambda_eta_c"].detach().cpu().tolist(),
             "cens_layers": list(hyp["cens_layers"]),
             "t_max": float(hyp["t_max"]),
             "C_percent": float(hyp["C_pct"]),
-            "C": float(C_admin.detach().cpu().item()),
+            "C": float(C_admin.detach().cpu().item()) if C_admin is not None else float("inf"),
+            "cov_indep_cens": bool(hyp["cov_indep_cens"]),
+            "censoring_dependence": str(
+                hyp.get("censoring_dependence", DEP_INDEP if hyp["cov_indep_cens"] else DEP_INFO)
+            ),
+            "admin_type1": bool(hyp["use_type1"]),
+            "admin_type2": bool(hyp["use_type2"]),
+            "q_type1": float(hyp["q_type1"]),
+            "random_cens": bool(hyp.get("use_random", True)),
+            "stagger_entry": r_frac is not None,
+            "accrual_frac": float(hyp.get("accrual_frac", 0.0)),
+            "accrual_shape": float(hyp.get("accrual_shape", 1.0)),
+            "r_min": float(r_frac.min().detach().cpu().item()) if r_frac is not None else 1.0,
+            "r_mean": float(r_frac.mean().detach().cpu().item()) if r_frac is not None else 1.0,
+            "event_frac": float(E.double().mean()),
+            **admin_info,
         }
         # Stash for offline debug / plotting helpers (generate_syn_data.py).
         # Not part of meta because the JSON serialiser in genload.save_sampled_params
@@ -480,4 +613,22 @@ class Reg2SurvDiscrete(nn.Module):
         self.last_S_event = S_event.detach().cpu().numpy()
         self.last_t_grid_scaled = (t_grid * hyp["t_max"]).detach().cpu().numpy()
         self.last_t_grid_norm = t_grid.detach().cpu().numpy()
-        return X, (T_obs, E), meta
+        # T_cens includes administrative censoring, so T_obs == min(T, T_cens).
+        if C_admin is None:
+            T_cens = C
+        else:
+            # Same double-precision product as apply_admin_censoring, so ties at the horizon agree with E.
+            limit = C_admin if r_frac is None else r_frac.double() * C_admin
+            T_cens = torch.minimum(C, limit.to(C.dtype))
+        y_out = {"T_obs": T_obs, "E": E, "T_event": T, "T_cens": T_cens}
+        if self.hp.get("save_surv_curve", False):
+            # Native generation grid over the full support [0, t_max]. U ~ U(0.01, 0.99) truncates the
+            # sampled law, so the curve of the T actually drawn is the net's S rescaled to that range.
+            y_out["t_grid"] = t_grid * hyp["t_max"]
+            S = ((S_event - 0.01) / 0.98).clamp(0.0, 1.0)
+            # An event net that is flat in t makes compute_survival 0/0 (NaN row); invert_survival then
+            # puts that row at a single time T, so its curve is the step 1[t < T].
+            flat = ~torch.isfinite(S).all(dim=1)
+            S[flat] = (y_out["t_grid"].unsqueeze(0) < T[flat].unsqueeze(1)).to(S.dtype)
+            y_out["S"] = S
+        return X, y_out, meta

@@ -32,12 +32,27 @@ DEFAULT_FIXED_HP = {
         "gamma_k_bounds": (0.3, 2.5),
         "mu_t_bounds": (0.3, 0.7),
         "lambda_eta_bounds": (0.5, 2.5),
+        "lambda_eta_cens_bounds": (0.5, 2.5),
         "n_event_layers_bounds": (1, 3),
         "event_layer_bounds": (8, 64),
         "n_cens_layers_bounds": (1, 2),
         "cens_layer_bounds": (8, 32),
-        "t_max_bounds": (1.0, 100.0),
+        "t_max_bounds": (1.0, 10000.0),
         "censoring_rate_bounds": (0.1, 0.9),
+        # Random censoring switch: off means C = +inf (admin-only / uncensored datasets).
+        "p_random": 0.85,
+        # Administrative censoring: independent switches, earliest cutoff wins.
+        "p_type1": 0.5,
+        "p_type2": 0.5,
+        "type1_quantile_bounds": (0.05, 0.95),
+        "type2_quantile_bounds": (0.1, 0.9),
+        # Staggered entry: subject i is followed for r_i * tau, r_i = 1 - a * U^(1/k).
+        "p_stagger_entry": 0.75,
+        "accrual_frac_bounds": (0.0, 1.0),
+        "accrual_shape_bounds": (0.2, 1.0),
+        # Exclusive probs: indep / info / covdep (remainder). Must sum to ≤ 1.
+        "p_cov_indep_cens": 0.25,
+        "p_informative_cens": 0.0,
         "event_net_max_tries": 1,
         "event_net_min_median_delta": 0.0,
         "event_net_max_flat_frac": 1.0,

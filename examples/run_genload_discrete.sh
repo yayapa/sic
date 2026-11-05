@@ -7,9 +7,11 @@
 #   3. bash examples/run_genload_discrete.sh
 #
 # Prior hyperparameters: configs/gen/reg2surv_discrete_params.yaml
+# 5300 batches x 512 datasets is the size used for the released checkpoints;
+# lower --num_batches for a quick test.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA_ROOT="${REPO_ROOT}/data"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 
 # activate your sic conda environment
 
@@ -18,7 +20,7 @@ python -m sic.prior.genload \
     --reg2surv_discrete_config "${REPO_ROOT}/configs/gen/reg2surv_discrete_params.yaml" \
     --np_seed 42 \
     --torch_seed 42 \
-    --num_batches 100 \
+    --num_batches 10 \
     --resume_from 0 \
     --batch_size 512 \
     --batch_size_per_gp 1 \

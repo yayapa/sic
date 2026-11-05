@@ -242,9 +242,27 @@ class MLPSCM(nn.Module):
             nn.init.normal_(param, std=std)
             param *= torch.bernoulli(torch.full_like(param, 1 - dropout_prob))
 
-    def forward(self):
-        """Generates synthetic data by sampling input features and applying MLP transformations."""
-        causes = self.xsampler.sample()  # (seq_len, num_causes)
+    def forward(self, causes: torch.Tensor | None = None):
+        """Generates synthetic data by sampling (or injecting) causes and applying MLP transforms.
+
+        Parameters
+        ----------
+        causes : Tensor, optional
+            If provided, used as the root input instead of ``XSampler``. Shape
+            ``(N, num_causes)``. Only valid when ``is_causal=False`` (non-causal
+            ``handle_outputs`` returns ``X=causes``, ``y=f(causes)``).
+        """
+        if causes is None:
+            causes = self.xsampler.sample()  # (seq_len, num_causes)
+        else:
+            if self.is_causal:
+                raise ValueError("Injecting causes requires is_causal=False")
+            if causes.ndim != 2 or causes.shape[1] != self.num_causes:
+                raise ValueError(
+                    f"causes shape {tuple(causes.shape)} incompatible with "
+                    f"num_causes={self.num_causes}"
+                )
+            causes = causes.to(device=self.device)
 
         # Generate outputs through MLP layers
         outputs = [causes]

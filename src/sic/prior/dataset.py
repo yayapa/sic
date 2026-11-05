@@ -147,11 +147,11 @@ class Prior:
         if not isinstance(min_train_size, (int, float)) or not isinstance(max_train_size, (int, float)):
             raise TypeError("Training sizes must be int or float")
 
-        # Check for valid ranges based on type
+        # Check for valid ranges based on type (min == max pins a fixed train size)
         if isinstance(min_train_size, int) and isinstance(max_train_size, int):
-            assert 0 < min_train_size < max_train_size, "0 < min_train_size < max_train_size"
+            assert 0 < min_train_size <= max_train_size, "0 < min_train_size <= max_train_size"
         elif isinstance(min_train_size, float) and isinstance(max_train_size, float):
-            assert 0 < min_train_size < max_train_size < 1, "0 < min_train_size < max_train_size < 1"
+            assert 0 < min_train_size <= max_train_size < 1, "0 < min_train_size <= max_train_size < 1"
         else:
             raise ValueError("Both training sizes must be of the same type (int or float)")
 
@@ -237,9 +237,15 @@ class Prior:
             If training size range has incompatible types
         """
         if isinstance(min_train_size, int) and isinstance(max_train_size, int):
-            train_size = np.random.randint(min_train_size, max_train_size)
-        elif isinstance(min_train_size, float) and isinstance(min_train_size, float):
-            train_size = np.random.uniform(min_train_size, max_train_size)
+            if min_train_size == max_train_size:
+                train_size = min_train_size
+            else:
+                train_size = np.random.randint(min_train_size, max_train_size)
+        elif isinstance(min_train_size, float) and isinstance(max_train_size, float):
+            if min_train_size == max_train_size:
+                train_size = min_train_size
+            else:
+                train_size = np.random.uniform(min_train_size, max_train_size)
             train_size = int(seq_len * train_size)
         else:
             raise ValueError("Invalid training size range.")
@@ -519,13 +525,19 @@ class SCMPrior(Prior):
         self.num_threads_per_generate = num_threads_per_generate
         self.device = device
         if "reg2surv_param" in DEFAULT_FIXED_HP:
-            self.reg2surv = Reg2Surv(DEFAULT_FIXED_HP["reg2surv_param"].copy())
+            continuous_params = DEFAULT_FIXED_HP["reg2surv_param"].copy()
+            continuous_params.setdefault("device", self.device)
+            self.reg2surv = Reg2Surv(continuous_params)
+            self.reg2surv.scm_sampled_hp = self.sampled_hp
+            self.reg2surv.scm_fixed_hp = self.fixed_hp
         else:
             self.reg2surv = None
 
         discrete_params = DEFAULT_FIXED_HP.get("reg2surv_discrete_param", {}).copy()
         discrete_params.setdefault("device", self.device)
         self.reg2surv_discrete = Reg2SurvDiscrete({"reg2surv_discrete_param": discrete_params})
+        self.reg2surv_discrete.scm_sampled_hp = self.sampled_hp
+        self.reg2surv_discrete.scm_fixed_hp = self.fixed_hp
 
     def hp_sampling(self) -> Dict[str, Any]:
         """
@@ -572,13 +584,17 @@ class SCMPrior(Prior):
 
         while True:
             if reg2surv_discrete_flag:
-                # n_etas ~ Poisson(1), clamped at 1 (so 0 -> 1).
+                # n_etas ~ Poisson(1), clamped at 1 (so 0 -> 1). Twice as many
+                # outputs are drawn so that the event and censoring nets read
+                # disjoint SCM channels instead of sharing one risk score.
                 n_etas = int(np.random.poisson(lam=1.0))
                 if n_etas < 1:
                     n_etas = 1
-                params["num_outputs"] = n_etas
+                params["num_outputs"] = 2 * n_etas
             else:
-                params["num_outputs"] = 2 if reg2surv_flag else 1
+                # Two risk scores for the event process and two for censoring, so
+                # both follow the same extended-hazard structure.
+                params["num_outputs"] = 4 if reg2surv_flag else 1
 
             X, y = prior_cls(**params)()
 
@@ -586,11 +602,12 @@ class SCMPrior(Prior):
                 reg2cls = Reg2Cls(params)
                 X = reg2cls._num2cat(X)
                 X = reg2cls._process_features(X)
+                self.reg2surv_discrete.scm_prior_type = params.get("prior_type", "mlp_scm")
                 X, y, sampled_params_to_save = self.reg2surv_discrete(X, y)
-                # y is the tuple (T_obs, E); downstream get_batch stacks it.
+                # y is the dict {T_obs, E, T_event, T_cens[, t_grid, S]}; downstream get_batch stacks it.
                 # Reject degenerate observed times (all equal / near-equal).
                 try:
-                    T_obs = y[0]
+                    T_obs = y["T_obs"]
                     spread = (T_obs.max() - T_obs.min()).abs()
                     scale = float(T_obs.max().detach().cpu().item()) if T_obs.numel() else 0.0
                     eps = (1.0e-8 * max(scale, 1.0)) + 1.0e-12
@@ -608,7 +625,8 @@ class SCMPrior(Prior):
                 reg2cls = Reg2Cls(params)
                 X = reg2cls._num2cat(X)
                 X = reg2cls._process_features(X)
-                X, y, sampled_params_to_save = self.reg2surv(X, y)
+                self.reg2surv.scm_prior_type = params.get("prior_type", "mlp_scm")
+                X, y, sampled_params_to_save = self.reg2surv(X, y, train_size=params["train_size"])
             else:
                 X, y = Reg2Cls(params)(X, y)
 
@@ -621,8 +639,13 @@ class SCMPrior(Prior):
 
             X, d = self.delete_unique_features(X, d)
             if is_surv:
-                if torch.isnan(y[0]).any():
+                # Check for NaNs or infs in the observed times, or no events at all
+                if torch.isnan(y["T_obs"]).any() or torch.isinf(y["T_obs"]).any():
                     warnings.warn("NaNs in survival times, regenerating dataset...", UserWarning)
+                    continue
+                elif (y["E"] == 0).all():
+                    warnings.warn("All events are 0, regenerating dataset...", UserWarning)
+                    continue
 
                 return X.squeeze(0), y, d.squeeze(0), sampled_params_to_save
             else:
@@ -768,17 +791,14 @@ class SCMPrior(Prior):
             # Use nested tensors for variable sequence lengths
             X = nested_tensor([x.to(self.device) for x in X_list], device=self.device)
             if is_surv_batch:
-                y_list_new = []
-                for y_i in y_list:
-                    y_list_new.append(torch.stack([y_i[0].to(self.device), y_i[1].to(self.device)]))
-                y = nested_tensor(y_list_new, device=self.device)
+                raise NotImplementedError("seq_len_per_gp with survival targets (dict y) is not supported")
             else:
                 y = nested_tensor([y.to(self.device) for y in y_list], device=self.device)
         else:
             # Stack into regular tensors for fixed sequence length
             X = torch.stack(X_list).to(self.device)  # (B, T, H)
             if is_surv_batch:
-                y = torch.stack([torch.stack(y_list_i).to(self.device) for y_list_i in y_list])
+                y = {k: torch.stack([y_i[k] for y_i in y_list]).to(self.device) for k in y_list[0]}
             else:
                 y = torch.stack(y_list).to(self.device)  # (B, T)
 
