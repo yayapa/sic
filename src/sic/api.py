@@ -169,9 +169,9 @@ class SIC:
         z-score covariates using training-set statistics before inference.
     random_state : int, default=42
         Seed used for reproducible feature-permutation ensembles / any randomness.
-    n_estimators : int, default=8
+    n_estimators : int, default=1
         Number of feature-permutation ensemble members. Predictions average
-        survival curves ``S(t|x)`` over column orders. ``1`` disables ensembling.
+        survival curves ``S(t|x)`` over column orders. ``1`` (default) disables ensembling.
     """
 
     def __init__(
@@ -183,7 +183,7 @@ class SIC:
         allow_auto_download: bool = True,
         standardize: bool = False,
         random_state: int = 42,
-        n_estimators: int = 8,
+        n_estimators: int = 1,
     ):
         resolve_head(survival_head)  # validate early
         if int(n_estimators) < 1:

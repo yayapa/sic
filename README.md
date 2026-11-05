@@ -19,6 +19,9 @@
 
 ---
 
+> [!NOTE]
+> **November 2026:** A new version of SIC, accompanied by a new preprint ([v3 on arXiv](https://arxiv.org/abs/2603.29475v3)): a better prior, a continuous-time survival head, better calibration and discrimination, and superior performance across **58 publicly accessible datasets**, ranging from 100 to 280,845 samples, 3 to 160 raw features, and 0.066 to 0.945 censoring rates.
+
 The official implementation of the paper [Survival In-Context: Amortized Bayesian Survival Analysis via Prior-Fitted Networks](https://arxiv.org/pdf/2603.29475)
 
 SIC brings the PFN and ICL paradigms to survival analysis. SIC requires no hyperparameter tuning and no training, performing predictions using the training dataset as context.
@@ -73,8 +76,8 @@ surv = model.fit_predict_surv(
 
 Everything you need to know about running the model is in the example notebooks:
 
-- `examples/sic_walkthrough.ipynb` - notebook tour of SIC (SuMoPP): the `cindex_td` / `ibs_q90` evaluation grids, survival curves, and 5-fold CV with CSV/JSON output.
-- `examples/inspect_prior_batch.ipynb` - load one synthetic prior batch: Kaplan–Meier curves, event / censoring times, the censoring regimes, and a Cox PH sanity check.
+- `examples/sic_walkthrough.ipynb` - notebook tour of SIC: evaluation with C-index and IBS, survival curves, and 5-fold CV with CSV/JSON output.
+- `examples/inspect_prior_batch.ipynb` - load one synthetic prior batch: Kaplan–Meier curves, observed event / censoring times, and a Cox PH sanity check.
 
 ### Survival heads
 
@@ -88,7 +91,7 @@ You can also train SIC with other survival heads (see [Generating Prior and trai
 | `SuMo`               | SuMo-net (MrHuff)     | continuous S(t,x); mixed monotone-in-t             | `run_train_sumo.sh`      |
 | `CoxPH`              | proportional hazards  | 1 log-hazard / subject                             | `run_train_coxph.sh`     |
 | `DeepEH`             | extended hazard       | 2 hazards / subject                                | `run_train_deepeh.sh`    |
-| `DeepHit10`          | discrete-time DeepHit | 10 bins                                            | `run_train_deephit10.sh` |
+| `DeepHit10`          | discrete-time DeepHit | 10 bins (adjustable via `--num_bins`)              | `run_train_deephit10.sh` |
 
 To use a head you trained yourself, pass its checkpoint: `SIC(survival_head="SuMo", model_path="/path/to/step-10000.ckpt")`.
 
@@ -98,11 +101,11 @@ To use a head you trained yourself, pass its checkpoint: `SIC(survival_head="SuM
 
 ```bash
 pip install -e ".[survset]"
-bash examples/run_eval_survset.sh                 # whole benchmark, released SuMoPP weights
+bash examples/run_eval_survset.sh                 # whole benchmark, released SIC weights
 python examples/run_eval_survset.py --model_path /path/to/model.ckpt --datasets hdfail METABRIC
 ```
 
-Both write the per-fold metrics to `.xlsx` and `.json`. `cindex_td` is computed on the unique test times and `ibs_q90` on 100 points from the first training event time to the 90th percentile of the training durations (see `sic.horizons`).
+Both write the per-fold metrics to `.xlsx` and `.json`.
 
 The restricted-access SEER and UNOS datasets are not distributed. If you have access, put `seernfg.csv` / `unos.csv` in a folder and pass `--data_dir` (or set `SIC_DATA_DIR`); they are then added to the benchmark automatically.
 
@@ -113,7 +116,7 @@ See `examples/` for scripts and notebooks. Workflow:
 ```bash
 bash examples/run_genload_continuous.sh   # synthetic continuous priors
 bash examples/run_genload_discrete.sh     # synthetic discrete priors
-bash examples/run_train_sumopp.sh         # train the default SuMoPP head (run genload first)
+bash examples/run_train_sumopp.sh         # train SIC with the default head (run genload first)
 ```
 
 Other heads: `run_train_sumo.sh`, `run_train_deephit10.sh`, `run_train_deepeh.sh`, `run_train_coxph.sh`. Edit paths and hyperparameters at the top of each script (or export `DATA_ROOT`, `CHECKPOINT_ROOT`, `CHECKPOINT_PATH`). Inspect a prior batch: `examples/inspect_prior_batch.ipynb`.
@@ -130,7 +133,7 @@ We thank [Adil](https://github.com/AdilKoken) for implementing the SuMo++ Head.
 
 We thank the authors of [TabICL](https://arxiv.org/pdf/2502.05564) for making PFNs open source! We used their codebase to develop our model.
 
-Additionally, we actively used in the development the work [CiPOT](https://arxiv.org/pdf/2410.20579v3), [CSD](https://arxiv.org/pdf/2405.07374), and [torchssurv](https://github.com/novartis/torchsurv). We thank the authors for making their code public.
+Additionally, we actively used in the development [torchsurv](https://github.com/novartis/torchsurv). We thank the authors for making their code public.
 
 ## LLM Note
 

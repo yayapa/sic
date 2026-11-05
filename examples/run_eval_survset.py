@@ -78,8 +78,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Folder with restricted CSVs (unos.csv, seernfg.csv); sets $SIC_DATA_DIR.")
     p.add_argument("--k_folds", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--n_estimators", type=int, default=8,
-                   help="Feature-permutation ensemble size (default: 8). Use 1 to disable.")
+    p.add_argument("--n_estimators", type=int, default=1,
+                   help="Feature-permutation ensemble size (default: 1, no ensembling).")
     p.add_argument("--device", default=None, help="torch device (default: cuda if available).")
     p.add_argument("--out", type=Path, default=Path("eval_survset.xlsx"))
     p.add_argument("--json-out", type=Path, default=None,
